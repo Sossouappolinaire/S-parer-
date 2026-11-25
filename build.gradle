@@ -14,12 +14,13 @@ android {
         versionName '1.0'
     }
 
-    // Tout est à la racine : manifeste + fichiers .java (pas de dossier src/)
+    // Tout est à la racine : manifeste + fichiers .java (pas de dossier src/).
+    // Les .java sont copiés dans build/generated/flatjava avant la compilation :
+    // déclarer la racine comme dossier source fait entrer en conflit les tâches Gradle.
     sourceSets {
         main {
             manifest.srcFile 'AndroidManifest.xml'
-            java.srcDirs = ['.']
-            java.filter.include('*.java')
+            java.setSrcDirs([layout.buildDirectory.dir('generated/flatjava').get().asFile])
         }
     }
 
@@ -33,4 +34,19 @@ android {
             minifyEnabled false
         }
     }
+}
+
+def copyJavaSources = tasks.register('copyJavaSources', Copy) {
+    from(projectDir) {
+        include '*.java'
+    }
+    into layout.buildDirectory.dir('generated/flatjava')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    dependsOn copyJavaSources
+}
+
+tasks.matching { it.name == 'preBuild' }.configureEach {
+    dependsOn copyJavaSources
 }
