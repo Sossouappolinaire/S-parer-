@@ -1,0 +1,1287 @@
+package com.stemnotes;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.graphics.Typeface;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextUtils;
+import android.text.TextWatcher;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class MainActivity extends Activity {
+
+    private static final int REQ_SONG = 1;
+    private static final int REQ_STEM = 2;
+    private static final int REQ_SAVE = 3;
+
+    private static final int M = ViewGroup.LayoutParams.MATCH_PARENT;
+    private static final int W = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+    private static final String[] NAV_LABELS = {"Accueil", "Pistes", "Aide", "Profil"};
+    private static final int[] NAV_ICONS = {IconView.HOME, IconView.BARS, IconView.HELP, IconView.USER};
+
+    private static final class Stem {
+        final String name;
+        final File file;
+        boolean selected = true;
+        boolean poly;
+        List<PitchTranscriber.Note> notes;
+        volatile float pct;
+        BarView bar;
+        TextView pctLabel;
+
+        Stem(String name, File file) {
+            this.name = name;
+            this.file = file;
+        }
+    }
+
+    private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final List<Stem> stems = new ArrayList<>();
+    private final Set<String> seenDone = new HashSet<>();
+    private final int[] scrollYs = new int[4];
+    private final boolean[] helpOpen = new boolean[5];
+
+    private SharedPreferences prefs;
+    private FrameLayout content;
+    private LinearLayout[] navItems;
+    private IconView[] navIcons;
+    private TextView[] navLabels;
+
+    private int tab = 0;
+    private int renderedTab = -1;
+    private int segment = 0; // onglet Pistes : 0 = pistes, 1 = notes
+
+    private Uri songUri;
+    private String songName = "";
+    private byte[] pendingMidi;
+    private boolean savedOnce = false;
+    private int importCounter = 0;
+
+    private volatile boolean busy = false;
+    private volatile boolean sepRunning = false;
+    private volatile boolean anaRunning = false;
+    private volatile float sepPct = 0f;      // 0..100
+    private volatile float anaPct = 0f;      // 0..1
+    private volatile String sepStatus = "";
+    private volatile String anaStatus = "";
+
+    // vues « vivantes » mises à jour pendant les tâches (nulles si l'écran n'est pas affiché)
+    private BarView homeSepBar, homeAnaBar, progressBar;
+    private TextView homeSepText, homeAnaText, progressLabel, extractLabel;
+    private ArtView homeArt1, homeArt2;
+
+    // ============================================================ cycle de vie
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        Ui.init(this);
+        prefs = getSharedPreferences("stemnotes", MODE_PRIVATE);
+
+        getWindow().setStatusBarColor(Ui.CREAM);
+        getWindow().setNavigationBarColor(Ui.WHITE);
+        int flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        getWindow().getDecorView().setSystemUiVisibility(flags);
+
+        LinearLayout root = vbox();
+        root.setBackgroundColor(Ui.CREAM);
+        content = new FrameLayout(this);
+        root.addView(content, new LinearLayout.LayoutParams(M, 0, 1f));
+        View line = new View(this);
+        line.setBackgroundColor(Ui.LINE);
+        root.addView(line, new LinearLayout.LayoutParams(M, Ui.dp(1)));
+        root.addView(buildNav(), new LinearLayout.LayoutParams(M, W));
+        setContentView(root);
+
+        render(false);
+        loadTokenFromSupabase();
+    }
+
+    /** Récupère la clé MVSEP dans Supabase au lancement et l'enregistre. */
+    private void loadTokenFromSupabase() {
+        exec.submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final String t = SupabaseConfig.fetchMvsepToken();
+                    if (t.isEmpty() || t.equals(prefs.getString("token", ""))) return;
+                    prefs.edit().putString("token", t).apply();
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            render(false);
+                        }
+                    });
+                } catch (Exception ignored) {
+                    // hors ligne : on garde la clé déjà enregistrée
+                }
+            }
+        });
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        exec.shutdownNow();
+    }
+
+    // ============================================================ navigation
+    private View buildNav() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setBackgroundColor(Ui.WHITE);
+        bar.setPadding(Ui.dp(8), Ui.dp(8), Ui.dp(8), Ui.dp(8));
+        navItems = new LinearLayout[4];
+        navIcons = new IconView[4];
+        navLabels = new TextView[4];
+        for (int i = 0; i < 4; i++) {
+            LinearLayout it = vbox();
+            it.setGravity(Gravity.CENTER);
+            it.setPadding(0, Ui.dp(7), 0, Ui.dp(6));
+            IconView ic = new IconView(this, NAV_ICONS[i], Ui.MUTED);
+            it.addView(ic, new LinearLayout.LayoutParams(Ui.dp(22), Ui.dp(22)));
+            TextView t = Ui.text(this, NAV_LABELS[i], 11, Ui.MUTED, false);
+            t.setGravity(Gravity.CENTER);
+            it.addView(t, Ui.lp(W, W, 0, 2, 0, 0));
+            final int idx = i;
+            it.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { select(idx); }
+            });
+            navItems[i] = it;
+            navIcons[i] = ic;
+            navLabels[i] = t;
+            bar.addView(it, Ui.lp(0, W, 4, 0, 4, 0));
+            ((LinearLayout.LayoutParams) it.getLayoutParams()).weight = 1f;
+        }
+        return bar;
+    }
+
+    private void updateNav() {
+        for (int i = 0; i < 4; i++) {
+            boolean on = i == tab;
+            navItems[i].setBackground(on ? Ui.box(Ui.YELLOW_PILL, 16, 0, 0) : null);
+            navIcons[i].setColor(on ? Ui.INK : Ui.MUTED);
+            navLabels[i].setTextColor(on ? Ui.INK : Ui.MUTED);
+            navLabels[i].setTypeface(on ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+        }
+    }
+
+    private void select(int idx) {
+        if (idx == tab) return;
+        tab = idx;
+        render(true);
+    }
+
+    private void openReview(int seg) {
+        segment = seg;
+        tab = 1;
+        render(true);
+    }
+
+    // ============================================================ rendu
+    private void render(boolean animate) {
+        if (renderedTab >= 0 && content.getChildCount() > 0) {
+            scrollYs[renderedTab] = content.getChildAt(0).getScrollY();
+        }
+        homeSepBar = null; homeAnaBar = null; progressBar = null;
+        homeSepText = null; homeAnaText = null; progressLabel = null; extractLabel = null;
+        homeArt1 = null; homeArt2 = null;
+        for (Stem s : stems) { s.bar = null; s.pctLabel = null; }
+
+        content.removeAllViews();
+        final ScrollView sv = new ScrollView(this);
+        sv.setFillViewport(true);
+        sv.setBackgroundColor(Ui.CREAM);
+        LinearLayout col = vbox();
+        col.setPadding(Ui.dp(16), Ui.dp(14), Ui.dp(16), Ui.dp(28));
+        sv.addView(col, new ViewGroup.LayoutParams(M, W));
+
+        switch (tab) {
+            case 0: buildHome(col); break;
+            case 1: buildReview(col); break;
+            case 2: buildHelp(col); break;
+            default: buildProfile(col); break;
+        }
+        content.addView(sv, new FrameLayout.LayoutParams(M, M));
+        renderedTab = tab;
+        updateNav();
+
+        final int y = scrollYs[tab];
+        sv.post(new Runnable() {
+            @Override public void run() { sv.scrollTo(0, y); }
+        });
+        if (animate) {
+            sv.setAlpha(0f);
+            sv.animate().alpha(1f).setDuration(180).start();
+        }
+    }
+
+    private void refreshLive() {
+        if (homeSepBar != null) {
+            homeSepBar.setProgress(sepPct / 100f, true);
+            if (homeSepText != null) homeSepText.setText((int) sepPct + " % · " + sepStatus);
+        }
+        if (homeAnaBar != null) {
+            homeAnaBar.setProgress(anaPct, true);
+            if (homeAnaText != null) homeAnaText.setText((int) (anaPct * 100) + " % · " + anaStatus);
+        }
+        if (progressBar != null) progressBar.setProgress(overallFraction(), true);
+        if (progressLabel != null) progressLabel.setText(nextStepLabel());
+        for (Stem s : stems) {
+            if (s.bar != null) s.bar.setProgress(s.notes != null ? 1f : s.pct, true);
+            if (s.pctLabel != null) s.pctLabel.setText(pctText(s));
+        }
+        if (extractLabel != null) extractLabel.setText(extractText());
+    }
+
+    private void postLive() {
+        ui.post(new Runnable() {
+            @Override public void run() { refreshLive(); }
+        });
+    }
+
+    // ============================================================ état
+    private boolean hasToken() {
+        return !prefs.getString("token", "").trim().isEmpty();
+    }
+
+    private boolean anyNotes() {
+        for (Stem s : stems) if (s.notes != null) return true;
+        return false;
+    }
+
+    private int selectedCount() {
+        int n = 0;
+        for (Stem s : stems) if (s.selected) n++;
+        return n;
+    }
+
+    private int doneSteps() {
+        int n;
+        if (!stems.isEmpty()) n = 3;
+        else n = (hasToken() ? 1 : 0) + (songUri != null ? 1 : 0);
+        if (anyNotes()) n++;
+        if (savedOnce) n++;
+        return n;
+    }
+
+    private float overallFraction() {
+        float f = doneSteps();
+        if (sepRunning) f += sepPct / 100f;
+        else if (anaRunning) f += anaPct;
+        return Math.min(1f, f / 5f);
+    }
+
+    private String nextStepLabel() {
+        if (sepRunning) return "Séparation en cours…";
+        if (anaRunning) return "Analyse en cours…";
+        if (!stems.isEmpty()) {
+            if (!anyNotes()) return "Étape suivante : extraire les notes";
+            if (!savedOnce) return "Étape suivante : enregistrer le MIDI";
+            return "Tout est terminé";
+        }
+        if (!hasToken()) return "Étape suivante : ajouter la clé API";
+        if (songUri == null) return "Étape suivante : choisir un morceau";
+        return "Étape suivante : lancer la séparation";
+    }
+
+    private String pctText(Stem s) {
+        return s.notes != null ? "100 %" : (int) (s.pct * 100) + " %";
+    }
+
+    private String extractText() {
+        if (anaRunning) return "Analyse… " + (int) (anaPct * 100) + " %";
+        return "Extraire les notes (" + selectedCount() + ")";
+    }
+
+    // ============================================================ ACCUEIL
+    private void buildHome(LinearLayout col) {
+        col.addView(header("Séparer & transcrire", true));
+        col.addView(progressCard());
+
+        // ---- Unité 1 : séparation
+        boolean tokenOk = hasToken();
+        boolean songOk = songUri != null || !stems.isEmpty();
+        boolean sepOk = !stems.isEmpty() && !sepRunning;
+        int d1 = (tokenOk ? 1 : 0) + (songOk ? 1 : 0) + (sepOk ? 1 : 0);
+
+        View btn1;
+        if (sepRunning) {
+            btn1 = pillButton("Séparation… " + (int) sepPct + " %", -1, false, null);
+        } else if (!tokenOk) {
+            btn1 = pillButton("Ajouter la clé API", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { select(3); }
+            });
+        } else if (songUri == null && stems.isEmpty()) {
+            btn1 = pillButton("Choisir un morceau", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { pickAudio(REQ_SONG); }
+            });
+        } else if (stems.isEmpty()) {
+            btn1 = pillButton("Lancer la séparation", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { startSeparation(); }
+            });
+        } else {
+            btn1 = pillButton("Terminé · voir les pistes", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { openReview(0); }
+            });
+        }
+        homeArt1 = new ArtView(this, Ui.YELLOW_BORDER, Ui.WHITE);
+        homeArt1.setActive(sepRunning);
+        col.addView(unitCard("Unité 1", "Séparer le morceau",
+                "Isole voix, basse, batterie et autres instruments.",
+                Ui.YELLOW, Ui.INK, d1, 3, homeArt1, btn1), Ui.lp(M, W, 0, 14, 0, 12));
+
+        col.addView(sectionRow("u1a", 1, "Clé API MVSEP",
+                tokenOk ? "Enregistrée" : "À renseigner dans Profil",
+                stateOf(tokenOk, true), false, null, new View.OnClickListener() {
+                    @Override public void onClick(View v) { select(3); }
+                }));
+        col.addView(sectionRow("u1b", 2, "Morceau",
+                songUri != null ? songName : (songOk ? "Piste importée" : "Choisir un fichier audio"),
+                stateOf(songOk, tokenOk), false, null, new View.OnClickListener() {
+                    @Override public void onClick(View v) { pickAudio(REQ_SONG); }
+                }));
+        View sepExtra = sepRunning ? runExtra(true) : null;
+        col.addView(sectionRow("u1c", 3, "Séparation",
+                sepRunning ? "Envoi et traitement chez MVSEP" : (sepOk ? stems.size() + " pistes prêtes" : "Lancer la séparation"),
+                sepRunning ? 1 : stateOf(sepOk, tokenOk && songOk), true, sepExtra, new View.OnClickListener() {
+                    @Override public void onClick(View v) { startSeparation(); }
+                }));
+
+        // ---- Unité 2 : extraction des notes
+        boolean unlocked2 = !stems.isEmpty();
+        boolean notes = anyNotes();
+        int d2 = (unlocked2 && selectedCount() > 0 ? 1 : 0) + (notes ? 2 : 0);
+        View btn2;
+        if (!unlocked2) {
+            btn2 = pillButton("Séparez d'abord un morceau", IconView.LOCK, false, null);
+        } else if (anaRunning) {
+            btn2 = pillButton("Analyse… " + (int) (anaPct * 100) + " %", -1, false, null);
+        } else if (notes) {
+            btn2 = pillButton("Voir les notes", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { openReview(1); }
+            });
+        } else if (selectedCount() == 0) {
+            btn2 = pillButton("Choisir les pistes", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { openReview(0); }
+            });
+        } else {
+            btn2 = pillButton("Analyser " + selectedCount() + " piste(s)", -1, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { startTranscription(); }
+            });
+        }
+        homeArt2 = new ArtView(this, Ui.OLIVE_DARK, Ui.CREAM);
+        homeArt2.setActive(anaRunning);
+        col.addView(unitCard("Unité 2", "Extraire les notes",
+                "Détecte les notes jouées par chaque instrument choisi.",
+                Ui.OLIVE, Ui.INK, d2, 3, homeArt2, btn2), Ui.lp(M, W, 0, 10, 0, 12));
+
+        if (unlocked2) {
+            col.addView(sectionRow("u2a", 1, "Choisir les pistes",
+                    selectedCount() + " cochée(s) sur " + stems.size(),
+                    stateOf(selectedCount() > 0, true), false, null, new View.OnClickListener() {
+                        @Override public void onClick(View v) { openReview(0); }
+                    }));
+            View anaExtra = anaRunning ? runExtra(false) : null;
+            col.addView(sectionRow("u2b", 2, "Analyse",
+                    anaRunning ? "Détection des notes sur le téléphone" : (notes ? "Terminée" : "Extraire les notes des pistes cochées"),
+                    anaRunning ? 1 : stateOf(notes, selectedCount() > 0), false, anaExtra, new View.OnClickListener() {
+                        @Override public void onClick(View v) { startTranscription(); }
+                    }));
+            col.addView(sectionRow("u2c", 3, "Résultats",
+                    notes ? "Voir les notes détectées" : "Disponibles après l'analyse",
+                    stateOf(notes, notes), true, null, new View.OnClickListener() {
+                        @Override public void onClick(View v) { if (notes()) openReview(1); }
+                    }));
+        }
+
+        // ---- Unité 3 : export
+        View btn3;
+        if (!notes) {
+            btn3 = pillButton("Analysez d'abord des pistes", IconView.LOCK, false, null);
+        } else {
+            btn3 = pillButton(savedOnce ? "MIDI enregistré · en refaire un" : "Enregistrer le MIDI", -1, true,
+                    new View.OnClickListener() {
+                        @Override public void onClick(View v) { openReview(1); }
+                    });
+        }
+        ArtView art3 = new ArtView(this, 0xFF1F4D38, Ui.YELLOW);
+        col.addView(unitCard("Unité 3", "Exporter en MIDI",
+                "Un fichier par instrument, ou tout en un seul.",
+                Ui.GREEN_DARK, Ui.WHITE, savedOnce ? 1 : 0, 1, art3, btn3), Ui.lp(M, W, 0, 10, 0, 0));
+
+        refreshLive();
+    }
+
+    private boolean notes() {
+        return anyNotes();
+    }
+
+    /** 2 = terminé, 1 = en cours, 0 = verrouillé. */
+    private int stateOf(boolean done, boolean available) {
+        if (done) return 2;
+        return available ? 1 : 0;
+    }
+
+    private View runExtra(boolean sep) {
+        LinearLayout l = vbox();
+        BarView b = new BarView(this, Ui.LINE, Ui.ORANGE);
+        l.addView(b, Ui.lp(M, Ui.dp(8), 0, 8, 0, 0));
+        TextView t = Ui.text(this, "", 11, Ui.MUTED, false);
+        l.addView(t, Ui.lp(M, W, 0, 4, 0, 0));
+        if (sep) { homeSepBar = b; homeSepText = t; }
+        else { homeAnaBar = b; homeAnaText = t; }
+        return l;
+    }
+
+    private View progressCard() {
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1));
+        card.setPadding(Ui.dp(16), Ui.dp(14), Ui.dp(16), Ui.dp(14));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout texts = vbox();
+        texts.addView(Ui.text(this, "Voir ma progression", 12, Ui.MUTED, false));
+        progressLabel = Ui.text(this, nextStepLabel(), 15, Ui.INK, true);
+        texts.addView(progressLabel, Ui.lp(W, W, 0, 2, 0, 0));
+        top.addView(texts, new LinearLayout.LayoutParams(0, W, 1f));
+        top.addView(new IconView(this, IconView.ARROW, Ui.INK), new LinearLayout.LayoutParams(Ui.dp(22), Ui.dp(22)));
+        card.addView(top);
+
+        progressBar = new BarView(this, Ui.TRACK, Ui.ORANGE);
+        card.addView(progressBar, Ui.lp(M, Ui.dp(8), 0, 12, 0, 0));
+        progressBar.setProgress(overallFraction(), true);
+        return card;
+    }
+
+    private View unitCard(String label, String title, String sub, int bg, int fg,
+                          int done, int count, ArtView art, View button) {
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(bg, 22, 0, 0));
+        card.setPadding(Ui.dp(16), Ui.dp(16), Ui.dp(16), Ui.dp(16));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout left = vbox();
+        TextView l = Ui.text(this, label, 11, fg, true);
+        l.setAlpha(0.75f);
+        left.addView(l);
+        left.addView(Ui.text(this, title, 18, fg, true), Ui.lp(W, W, 0, 2, 0, 0));
+        TextView s = Ui.text(this, sub, 12, fg, false);
+        s.setAlpha(0.85f);
+        left.addView(s, Ui.lp(W, W, 0, 4, 0, 0));
+        DotsView dots = new DotsView(this);
+        dots.set(done, count);
+        left.addView(dots, Ui.lp(W, W, 0, 10, 0, 0));
+        top.addView(left, new LinearLayout.LayoutParams(0, W, 1f));
+        top.addView(art, Ui.lp(Ui.dp(96), Ui.dp(84), 8, 0, 0, 0));
+        card.addView(top);
+        card.addView(button, Ui.lp(M, W, 0, 14, 0, 0));
+        return card;
+    }
+
+    private View pillButton(String label, int icon, boolean enabled, View.OnClickListener l) {
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.HORIZONTAL);
+        b.setGravity(Gravity.CENTER);
+        b.setBackground(Ui.box(enabled ? Ui.WHITE : 0xB3FFFFFF, 16, 0, 0));
+        b.setPadding(Ui.dp(12), Ui.dp(12), Ui.dp(12), Ui.dp(12));
+        if (icon >= 0) {
+            b.addView(new IconView(this, icon, enabled ? Ui.INK : Ui.MUTED),
+                    Ui.lp(Ui.dp(16), Ui.dp(16), 0, 0, 8, 0));
+        }
+        b.addView(Ui.text(this, label, 14, enabled ? Ui.INK : Ui.MUTED, true));
+        if (enabled && l != null) {
+            b.setOnClickListener(l);
+            Ui.pressable(b);
+        }
+        return b;
+    }
+
+    private View sectionRow(String key, int number, String title, String sub, int state,
+                            boolean last, View extra, View.OnClickListener click) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        FrameLayout left = new FrameLayout(this);
+        View line = new View(this);
+        line.setBackgroundColor(Ui.LINE);
+        line.setVisibility(last ? View.INVISIBLE : View.VISIBLE);
+        left.addView(line, new FrameLayout.LayoutParams(Ui.dp(2), M, Gravity.CENTER_HORIZONTAL));
+
+        FrameLayout badge = new FrameLayout(this);
+        if (state == 2) {
+            badge.setBackground(Ui.oval(Ui.GREEN_OK));
+            badge.addView(new IconView(this, IconView.CHECK, Ui.WHITE),
+                    new FrameLayout.LayoutParams(Ui.dp(16), Ui.dp(16), Gravity.CENTER));
+        } else {
+            GradientDrawableHolder.apply(badge, state == 1);
+            TextView n = Ui.text(this, String.valueOf(number), 12, state == 1 ? Ui.INK : Ui.MUTED, true);
+            n.setGravity(Gravity.CENTER);
+            badge.addView(n, new FrameLayout.LayoutParams(M, M));
+        }
+        FrameLayout.LayoutParams bp = new FrameLayout.LayoutParams(Ui.dp(28), Ui.dp(28),
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        bp.topMargin = Ui.dp(14);
+        left.addView(badge, bp);
+        row.addView(left, new LinearLayout.LayoutParams(Ui.dp(36), M));
+
+        if (state == 2) {
+            if (!seenDone.contains(key)) {
+                seenDone.add(key);
+                Ui.pop(badge);
+            }
+        } else {
+            seenDone.remove(key);
+        }
+
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 16, state == 1 ? Ui.YELLOW_BORDER : Ui.YELLOW_SOFT, 1.5f));
+        card.setPadding(Ui.dp(14), Ui.dp(12), Ui.dp(14), Ui.dp(12));
+        LinearLayout inner = new LinearLayout(this);
+        inner.setOrientation(LinearLayout.HORIZONTAL);
+        inner.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout texts = vbox();
+        texts.addView(Ui.text(this, "Section " + number, 11, Ui.MUTED, false));
+        texts.addView(Ui.text(this, title, 15, state == 0 ? Ui.MUTED : Ui.INK, true), Ui.lp(W, W, 0, 1, 0, 0));
+        TextView st = Ui.text(this, sub, 12, Ui.MUTED, false);
+        st.setMaxLines(1);
+        st.setEllipsize(TextUtils.TruncateAt.END);
+        texts.addView(st, Ui.lp(W, W, 0, 2, 0, 0));
+        inner.addView(texts, new LinearLayout.LayoutParams(0, W, 1f));
+        IconView trail = new IconView(this,
+                state == 0 ? IconView.LOCK : (state == 2 ? IconView.CHECK : IconView.CHEVRON),
+                state == 2 ? Ui.GREEN_OK : Ui.MUTED);
+        trail.setRotation(state == 1 ? -90f : 0f);
+        inner.addView(trail, Ui.lp(Ui.dp(20), Ui.dp(20), 8, 0, 0, 0));
+        card.addView(inner);
+        if (extra != null) card.addView(extra);
+        if (click != null) {
+            card.setOnClickListener(click);
+            Ui.pressable(card);
+        }
+        row.addView(card, Ui.lp(0, W, 0, 0, 0, 10));
+        ((LinearLayout.LayoutParams) card.getLayoutParams()).weight = 1f;
+        return row;
+    }
+
+    /** Petit utilitaire pour le fond des pastilles numérotées. */
+    private static final class GradientDrawableHolder {
+        static void apply(View v, boolean current) {
+            android.graphics.drawable.GradientDrawable g = Ui.oval(current ? Ui.WHITE : Ui.LINE);
+            if (current) g.setStroke(Ui.dp(2), Ui.YELLOW_BORDER);
+            v.setBackground(g);
+        }
+    }
+
+    // ============================================================ PISTES (Review)
+    private void buildReview(LinearLayout col) {
+        col.addView(header("Pistes", false));
+        col.addView(segmented("Pistes", "Notes", segment));
+        if (segment == 0) buildStems(col);
+        else buildNotes(col);
+    }
+
+    private View segmented(String a, String b, int sel) {
+        LinearLayout track = new LinearLayout(this);
+        track.setOrientation(LinearLayout.HORIZONTAL);
+        track.setBackground(Ui.box(Ui.TRACK, 14, 0, 0));
+        track.setPadding(Ui.dp(4), Ui.dp(4), Ui.dp(4), Ui.dp(4));
+        String[] labels = {a, b};
+        for (int i = 0; i < 2; i++) {
+            TextView t = Ui.text(this, labels[i], 14, i == sel ? Ui.INK : Ui.MUTED, i == sel);
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(0, Ui.dp(9), 0, Ui.dp(9));
+            if (i == sel) t.setBackground(Ui.box(Ui.WHITE, 11, Ui.LINE, 1));
+            final int idx = i;
+            t.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    if (segment != idx) { segment = idx; render(false); }
+                }
+            });
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, W, 1f);
+            track.addView(t, p);
+        }
+        LinearLayout.LayoutParams lp = Ui.lp(M, W, 0, 0, 0, 16);
+        track.setLayoutParams(lp);
+        return track;
+    }
+
+    private void buildStems(LinearLayout col) {
+        col.addView(Ui.text(this, "Piste à la une", 16, Ui.INK, true), Ui.lp(W, W, 0, 0, 0, 8));
+
+        LinearLayout feat = new LinearLayout(this);
+        feat.setOrientation(LinearLayout.HORIZONTAL);
+        feat.setGravity(Gravity.CENTER_VERTICAL);
+        feat.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+        feat.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(10), Ui.dp(14));
+        LinearLayout ft = vbox();
+        if (stems.isEmpty()) {
+            ft.addView(Ui.text(this, "Aucune piste pour l'instant", 16, Ui.INK, true));
+            TextView d = Ui.text(this, "Séparez un morceau depuis l'accueil ou importez une piste déjà isolée.", 12, Ui.MUTED, false);
+            ft.addView(d, Ui.lp(W, W, 0, 4, 0, 0));
+        } else {
+            Stem f = stems.get(0);
+            LinearLayout tags = new LinearLayout(this);
+            tags.setOrientation(LinearLayout.HORIZONTAL);
+            tags.addView(pill(f.poly ? "POLY" : "MONO", Ui.YELLOW_SOFT, Ui.INK));
+            tags.addView(pill(f.name, Ui.TRACK, Ui.MUTED), Ui.lp(W, W, 6, 0, 0, 0));
+            ft.addView(tags);
+            ft.addView(Ui.text(this, f.notes != null ? f.name + " · " + f.notes.size() + " notes" : f.name, 18, Ui.INK, true),
+                    Ui.lp(W, W, 0, 8, 0, 0));
+            ft.addView(Ui.text(this, f.notes != null ? "Analyse terminée" : "Prête à être analysée", 12, Ui.MUTED, false),
+                    Ui.lp(W, W, 0, 3, 0, 0));
+        }
+        feat.addView(ft, new LinearLayout.LayoutParams(0, W, 1f));
+        feat.addView(new ArtView(this, Ui.YELLOW, Ui.OLIVE_DARK), Ui.lp(Ui.dp(76), Ui.dp(68), 8, 0, 0, 0));
+        col.addView(feat);
+
+        // « Mes pistes » + bouton Importer
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.addView(Ui.text(this, "Mes pistes", 16, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
+        LinearLayout add = new LinearLayout(this);
+        add.setOrientation(LinearLayout.HORIZONTAL);
+        add.setGravity(Gravity.CENTER_VERTICAL);
+        add.setBackground(Ui.box(Ui.WHITE, 14, Ui.YELLOW_BORDER, 1));
+        add.setPadding(Ui.dp(12), Ui.dp(7), Ui.dp(14), Ui.dp(7));
+        add.addView(new IconView(this, IconView.PLUS, Ui.INK), Ui.lp(Ui.dp(14), Ui.dp(14), 0, 0, 6, 0));
+        add.addView(Ui.text(this, "Importer", 13, Ui.INK, true));
+        add.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { pickAudio(REQ_STEM); }
+        });
+        Ui.pressable(add);
+        head.addView(add);
+        col.addView(head, Ui.lp(M, W, 0, 20, 0, 10));
+
+        // grille 2 colonnes
+        for (int i = 0; i < stems.size(); i += 2) {
+            LinearLayout r = new LinearLayout(this);
+            r.setOrientation(LinearLayout.HORIZONTAL);
+            r.addView(stemCard(stems.get(i)), Ui.lp(0, W, 0, 0, 6, 12));
+            ((LinearLayout.LayoutParams) r.getChildAt(0).getLayoutParams()).weight = 1f;
+            if (i + 1 < stems.size()) {
+                r.addView(stemCard(stems.get(i + 1)), Ui.lp(0, W, 6, 0, 0, 12));
+            } else {
+                r.addView(new View(this), Ui.lp(0, 1, 6, 0, 0, 0));
+            }
+            ((LinearLayout.LayoutParams) r.getChildAt(1).getLayoutParams()).weight = 1f;
+            col.addView(r);
+        }
+
+        if (!stems.isEmpty()) {
+            TextView b = Ui.text(this, extractText(), 15, Ui.WHITE, true);
+            b.setGravity(Gravity.CENTER);
+            b.setBackground(Ui.box(anaRunning ? 0xFFF0B48C : Ui.ORANGE, 18, 0, 0));
+            b.setPadding(0, Ui.dp(14), 0, Ui.dp(14));
+            if (!anaRunning) {
+                b.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View v) { startTranscription(); }
+                });
+                Ui.pressable(b);
+            }
+            extractLabel = b;
+            col.addView(b, Ui.lp(M, W, 0, 6, 0, 0));
+        }
+    }
+
+    private View stemCard(final Stem s) {
+        LinearLayout card = vbox();
+        card.setBackground(s.selected ? Ui.box(Ui.WHITE, 18, Ui.ORANGE, 2)
+                : Ui.box(Ui.WHITE, 18, Ui.YELLOW_SOFT, 1.5f));
+        card.setPadding(Ui.dp(14), Ui.dp(12), Ui.dp(14), Ui.dp(12));
+        TextView name = Ui.text(this, s.name, 15, Ui.INK, true);
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        card.addView(name);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        String state = anaRunning && s.selected && s.notes == null ? "En analyse…"
+                : (s.notes != null ? s.notes.size() + " notes" : "Non analysée");
+        row.addView(Ui.text(this, state, 11, Ui.MUTED, false), new LinearLayout.LayoutParams(0, W, 1f));
+        s.pctLabel = Ui.text(this, pctText(s), 11, Ui.INK, true);
+        row.addView(s.pctLabel);
+        card.addView(row, Ui.lp(M, W, 0, 4, 0, 6));
+
+        s.bar = new BarView(this, Ui.TRACK, Ui.ORANGE);
+        s.bar.setProgress(s.notes != null ? 1f : s.pct, false);
+        card.addView(s.bar, Ui.lp(M, Ui.dp(6), 0, 0, 0, 10));
+
+        TextView mode = Ui.text(this, (s.poly ? "Poly" : "Mono") + " · changer", 11, Ui.INK, true);
+        mode.setBackground(Ui.box(Ui.YELLOW_SOFT, 10, 0, 0));
+        mode.setPadding(Ui.dp(9), Ui.dp(4), Ui.dp(9), Ui.dp(4));
+        mode.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (anaRunning) return;
+                s.poly = !s.poly;
+                render(false);
+            }
+        });
+        card.addView(mode, Ui.lp(W, W, 0, 0, 0, 0));
+
+        card.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (anaRunning) return;
+                s.selected = !s.selected;
+                render(false);
+            }
+        });
+        Ui.pressable(card);
+        return card;
+    }
+
+    private void buildNotes(LinearLayout col) {
+        final List<String> names = new ArrayList<>();
+        final List<List<PitchTranscriber.Note>> tracks = new ArrayList<>();
+        for (final Stem s : stems) {
+            if (s.notes == null) continue;
+            names.add(s.name);
+            tracks.add(s.notes);
+
+            LinearLayout card = vbox();
+            card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+            card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
+            LinearLayout top = new LinearLayout(this);
+            top.setOrientation(LinearLayout.HORIZONTAL);
+            top.setGravity(Gravity.CENTER_VERTICAL);
+            top.addView(Ui.text(this, s.name, 17, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
+            top.addView(pill(s.notes.size() + " notes", Ui.YELLOW_SOFT, Ui.INK));
+            card.addView(top);
+            TextView list = Ui.text(this, describe(s.notes), 12, Ui.INK, false);
+            list.setTypeface(Typeface.MONOSPACE);
+            list.setTextIsSelectable(true);
+            card.addView(list, Ui.lp(M, W, 0, 10, 0, 10));
+            card.addView(pillButtonYellow("Enregistrer " + s.name + " en .mid", new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    List<List<PitchTranscriber.Note>> t1 = new ArrayList<>();
+                    t1.add(s.notes);
+                    saveMidi(MidiWriter.write(Collections.singletonList(s.name), t1), s.name);
+                }
+            }));
+            col.addView(card, Ui.lp(M, W, 0, 0, 0, 12));
+        }
+        if (tracks.isEmpty()) {
+            LinearLayout empty = vbox();
+            empty.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_SOFT, 1.5f));
+            empty.setPadding(Ui.dp(16), Ui.dp(16), Ui.dp(16), Ui.dp(16));
+            empty.addView(Ui.text(this, "Aucune note pour l'instant", 16, Ui.INK, true));
+            empty.addView(Ui.text(this, "Cochez des pistes dans l'onglet Pistes, puis lancez l'extraction.", 12, Ui.MUTED, false),
+                    Ui.lp(W, W, 0, 4, 0, 0));
+            col.addView(empty);
+        } else if (tracks.size() > 1) {
+            TextView b = Ui.text(this, "Tout enregistrer (un seul .mid)", 15, Ui.WHITE, true);
+            b.setGravity(Gravity.CENTER);
+            b.setBackground(Ui.box(Ui.ORANGE, 18, 0, 0));
+            b.setPadding(0, Ui.dp(14), 0, Ui.dp(14));
+            b.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    saveMidi(MidiWriter.write(names, tracks), "stemnotes_toutes_pistes");
+                }
+            });
+            Ui.pressable(b);
+            col.addView(b, Ui.lp(M, W, 0, 4, 0, 0));
+        }
+    }
+
+    private View pillButtonYellow(String label, View.OnClickListener l) {
+        TextView b = Ui.text(this, label, 14, Ui.INK, true);
+        b.setGravity(Gravity.CENTER);
+        b.setBackground(Ui.box(Ui.YELLOW_PILL, 14, 0, 0));
+        b.setPadding(Ui.dp(12), Ui.dp(11), Ui.dp(12), Ui.dp(11));
+        b.setOnClickListener(l);
+        Ui.pressable(b);
+        return b;
+    }
+
+    private TextView pill(String text, int bg, int fg) {
+        TextView t = Ui.text(this, text, 11, fg, true);
+        t.setBackground(Ui.box(bg, 10, 0, 0));
+        t.setPadding(Ui.dp(9), Ui.dp(3), Ui.dp(9), Ui.dp(3));
+        return t;
+    }
+
+    private String describe(List<PitchTranscriber.Note> notes) {
+        if (notes.isEmpty()) return "Aucune note détectée.";
+        StringBuilder sb = new StringBuilder();
+        int max = Math.min(notes.size(), 40);
+        for (int i = 0; i < max; i++) {
+            PitchTranscriber.Note n = notes.get(i);
+            int min = (int) (n.start / 60);
+            double sec = n.start - min * 60;
+            sb.append(String.format(Locale.US, "%d:%05.2f  %-4s %.2f s\n",
+                    min, sec, PitchTranscriber.noteName(n.pitch), n.end - n.start));
+        }
+        if (notes.size() > max) sb.append("… +").append(notes.size() - max).append(" dans le .mid");
+        return sb.toString().trim();
+    }
+
+    // ============================================================ AIDE
+    private void buildHelp(LinearLayout col) {
+        col.addView(header("Aide", false));
+        String[] titles = {"Comment ça marche", "Clé API MVSEP", "Mono ou Poly ?", "Pistes importées", "Limites"};
+        String[] bodies = {
+                "1. Ajoutez votre clé API dans Profil.\n2. Choisissez un morceau et lancez la séparation.\n3. Cochez les instruments voulus dans Pistes, choisissez Mono ou Poly, puis extrayez les notes.\n4. Enregistrez le fichier .mid.",
+                "Créez un compte gratuit sur mvsep.com et copiez la clé depuis mvsep.com/user-api. La séparation passe par une file d'attente : elle peut durer plusieurs minutes.",
+                "Mono : voix, basse, mélodie jouée une note à la fois.\nPoly : piano, guitare, accords (plusieurs notes en même temps).",
+                "Vous pouvez importer une piste déjà isolée (depuis MVSEP, Vocal Remover…) pour l'analyser sans passer par MVSEP, même hors ligne.",
+                "La détection est approximative sur les mélanges denses ; elle marche mieux sur des pistes bien isolées. Pendant l'attente chez MVSEP, la barre est une estimation."
+        };
+        int[] colors = {Ui.OLIVE, Ui.ORANGE, Ui.GREEN_DARK, Ui.YELLOW_BORDER, Ui.OLIVE_DARK};
+        int[] icons = {IconView.HOME, IconView.USER, IconView.BARS, IconView.PLUS, IconView.LOCK};
+        for (int i = 0; i < titles.length; i++) {
+            col.addView(helpRow(i, titles[i], bodies[i], colors[i], icons[i]), Ui.lp(M, W, 0, 0, 0, 10));
+        }
+    }
+
+    private View helpRow(final int idx, String title, String body, int color, int icon) {
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 16, Ui.YELLOW_SOFT, 1.5f));
+        card.setPadding(Ui.dp(12), Ui.dp(12), Ui.dp(12), Ui.dp(12));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        FrameLayout ic = new FrameLayout(this);
+        ic.setBackground(Ui.box(color, 10, 0, 0));
+        ic.addView(new IconView(this, icon, Ui.WHITE), new FrameLayout.LayoutParams(Ui.dp(18), Ui.dp(18), Gravity.CENTER));
+        head.addView(ic, Ui.lp(Ui.dp(36), Ui.dp(36), 0, 0, 12, 0));
+        head.addView(Ui.text(this, title, 15, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
+        final IconView chev = new IconView(this, IconView.CHEVRON, Ui.MUTED);
+        chev.setRotation(helpOpen[idx] ? 180f : 0f);
+        head.addView(chev, new LinearLayout.LayoutParams(Ui.dp(22), Ui.dp(22)));
+        card.addView(head);
+
+        final TextView tv = Ui.text(this, body, 13, Ui.MUTED, false);
+        tv.setLineSpacing(0f, 1.15f);
+        tv.setVisibility(helpOpen[idx] ? View.VISIBLE : View.GONE);
+        card.addView(tv, Ui.lp(M, W, 0, 10, 0, 0));
+
+        card.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                helpOpen[idx] = !helpOpen[idx];
+                tv.setVisibility(helpOpen[idx] ? View.VISIBLE : View.GONE);
+                chev.animate().rotation(helpOpen[idx] ? 180f : 0f).setDuration(200).start();
+            }
+        });
+        Ui.pressable(card);
+        return card;
+    }
+
+    // ============================================================ PROFIL
+    private void buildProfile(LinearLayout col) {
+        col.addView(header("Profil", false));
+
+        LinearLayout who = new LinearLayout(this);
+        who.setOrientation(LinearLayout.HORIZONTAL);
+        who.setGravity(Gravity.CENTER_VERTICAL);
+        FrameLayout av = new FrameLayout(this);
+        av.setBackground(Ui.oval(Ui.OLIVE));
+        av.addView(new IconView(this, IconView.USER, Ui.WHITE), new FrameLayout.LayoutParams(Ui.dp(32), Ui.dp(32), Gravity.CENTER));
+        who.addView(av, Ui.lp(Ui.dp(64), Ui.dp(64), 0, 0, 14, 0));
+        LinearLayout wt = vbox();
+        wt.addView(Ui.text(this, "Mon espace", 18, Ui.INK, true));
+        wt.addView(Ui.text(this, "Réglages et statistiques", 12, Ui.MUTED, false), Ui.lp(W, W, 0, 2, 0, 0));
+        who.addView(wt);
+        col.addView(who, Ui.lp(M, W, 0, 0, 0, 16));
+
+        LinearLayout stats = new LinearLayout(this);
+        stats.setOrientation(LinearLayout.HORIZONTAL);
+        stats.addView(statCard("Séparations", prefs.getInt("sep_count", 0)), Ui.lp(0, W, 0, 0, 6, 0));
+        stats.addView(statCard("Notes extraites", prefs.getInt("notes_total", 0)), Ui.lp(0, W, 6, 0, 0, 0));
+        ((LinearLayout.LayoutParams) stats.getChildAt(0).getLayoutParams()).weight = 1f;
+        ((LinearLayout.LayoutParams) stats.getChildAt(1).getLayoutParams()).weight = 1f;
+        col.addView(stats, Ui.lp(M, W, 0, 0, 0, 16));
+
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+        card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
+        card.addView(Ui.text(this, "Réglages MVSEP", 16, Ui.INK, true));
+        card.addView(field("Clé API (mvsep.com/user-api)", "token", "", false));
+        card.addView(field("Type de séparation (sep_type)", "sep_type", "20", true));
+        card.addView(field("Option du modèle (add_opt1, facultatif)", "opt1", "", false));
+        col.addView(card);
+    }
+
+    private View statCard(String label, int value) {
+        LinearLayout c = vbox();
+        c.setBackground(Ui.box(Ui.YELLOW, 18, 0, 0));
+        c.setPadding(Ui.dp(14), Ui.dp(12), Ui.dp(14), Ui.dp(12));
+        c.addView(Ui.text(this, String.valueOf(value), 24, Ui.INK, true));
+        c.addView(Ui.text(this, label, 12, Ui.INK, false));
+        return c;
+    }
+
+    private View field(String label, final String key, String def, boolean numeric) {
+        LinearLayout l = vbox();
+        l.addView(Ui.text(this, label, 12, Ui.MUTED, false), Ui.lp(W, W, 0, 12, 0, 4));
+        EditText e = new EditText(this);
+        e.setSingleLine(true);
+        e.setTextSize(14);
+        e.setTextColor(Ui.INK);
+        e.setBackground(Ui.box(Ui.CREAM, 12, Ui.YELLOW_SOFT, 1.5f));
+        e.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10));
+        if (numeric) e.setInputType(InputType.TYPE_CLASS_NUMBER);
+        e.setText(prefs.getString(key, def));
+        e.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) { }
+            @Override public void afterTextChanged(Editable s) {
+                prefs.edit().putString(key, s.toString().trim()).apply();
+            }
+        });
+        l.addView(e, new LinearLayout.LayoutParams(M, W));
+        return l;
+    }
+
+    // ============================================================ en-tête commun
+    private View header(String title, boolean chevron) {
+        LinearLayout wrap = vbox();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        FrameLayout logo = new FrameLayout(this);
+        logo.setBackground(Ui.oval(Ui.OLIVE));
+        logo.addView(new IconView(this, IconView.NOTE, Ui.WHITE),
+                new FrameLayout.LayoutParams(Ui.dp(22), Ui.dp(22), Gravity.CENTER));
+        row.addView(logo, new LinearLayout.LayoutParams(Ui.dp(40), Ui.dp(40)));
+        row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+        row.addView(chip(false, prefs.getInt("sep_count", 0)));
+        row.addView(chip(true, prefs.getInt("notes_total", 0)), Ui.lp(W, W, 8, 0, 0, 0));
+        wrap.addView(row);
+
+        LinearLayout trow = new LinearLayout(this);
+        trow.setOrientation(LinearLayout.HORIZONTAL);
+        trow.setGravity(Gravity.CENTER_VERTICAL);
+        trow.addView(Ui.text(this, title, 24, Ui.INK, true));
+        if (chevron) trow.addView(new IconView(this, IconView.CHEVRON, Ui.INK), Ui.lp(Ui.dp(22), Ui.dp(22), 4, 0, 0, 0));
+        wrap.addView(trow, Ui.lp(M, W, 0, 14, 0, 4));
+        return wrap;
+    }
+
+    private View chip(boolean red, int value) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.HORIZONTAL);
+        c.setGravity(Gravity.CENTER_VERTICAL);
+        c.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1));
+        c.setPadding(Ui.dp(10), Ui.dp(6), Ui.dp(12), Ui.dp(6));
+        if (red) {
+            FrameLayout b = new FrameLayout(this);
+            b.setBackground(Ui.oval(Ui.RED));
+            b.addView(new IconView(this, IconView.NOTE, Ui.WHITE),
+                    new FrameLayout.LayoutParams(Ui.dp(13), Ui.dp(13), Gravity.CENTER));
+            c.addView(b, new LinearLayout.LayoutParams(Ui.dp(20), Ui.dp(20)));
+        } else {
+            c.addView(new IconView(this, IconView.FLAME, Ui.ORANGE), new LinearLayout.LayoutParams(Ui.dp(18), Ui.dp(18)));
+        }
+        c.addView(Ui.text(this, String.valueOf(value), 14, Ui.INK, true), Ui.lp(W, W, 6, 0, 0, 0));
+        return c;
+    }
+
+    // ============================================================ fichiers
+    private void pickAudio(int req) {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("audio/*");
+        startActivityForResult(i, req);
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, Intent data) {
+        super.onActivityResult(req, result, data);
+        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        final Uri uri = data.getData();
+
+        if (req == REQ_SONG) {
+            songUri = uri;
+            songName = displayName(uri);
+            render(false);
+        } else if (req == REQ_STEM) {
+            if (busy) { toast("Une tâche est en cours"); return; }
+            busy = true;
+            final String name = displayName(uri);
+            final int id = ++importCounter;
+            exec.execute(new Runnable() {
+                @Override public void run() {
+                    try {
+                        final File f = copyToCache(uri, "import_" + id);
+                        ui.post(new Runnable() {
+                            @Override public void run() {
+                                stems.add(new Stem(name, f));
+                                stems.get(stems.size() - 1).poly = guessPoly(name);
+                                render(false);
+                                toast("Piste importée : " + name);
+                            }
+                        });
+                    } catch (Throwable e) {
+                        toastLater("Erreur : " + e.getMessage());
+                    } finally {
+                        busy = false;
+                    }
+                }
+            });
+        } else if (req == REQ_SAVE) {
+            try {
+                OutputStream os = getContentResolver().openOutputStream(uri);
+                try {
+                    os.write(pendingMidi);
+                } finally {
+                    os.close();
+                }
+                savedOnce = true;
+                toast("Fichier MIDI enregistré");
+                render(false);
+            } catch (Exception e) {
+                toast("Échec de l'enregistrement : " + e.getMessage());
+            }
+        }
+    }
+
+    private boolean guessPoly(String name) {
+        String low = name.toLowerCase(Locale.ROOT);
+        return low.contains("piano") || low.contains("other") || low.contains("guitar")
+                || low.contains("guitare") || low.contains("key") || low.contains("instrum")
+                || low.contains("music");
+    }
+
+    private String displayName(Uri uri) {
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, null, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) return c.getString(idx);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.close();
+        }
+        return "audio";
+    }
+
+    private File copyToCache(Uri uri, String name) throws Exception {
+        File out = new File(getCacheDir(), name);
+        InputStream in = getContentResolver().openInputStream(uri);
+        FileOutputStream os = new FileOutputStream(out);
+        try {
+            byte[] b = new byte[65536];
+            int r;
+            while ((r = in.read(b)) > 0) os.write(b, 0, r);
+        } finally {
+            os.close();
+            in.close();
+        }
+        return out;
+    }
+
+    private void saveMidi(byte[] data, String name) {
+        pendingMidi = data;
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("audio/midi");
+        i.putExtra(Intent.EXTRA_TITLE, name.replaceAll("[^A-Za-z0-9_-]", "_") + ".mid");
+        startActivityForResult(i, REQ_SAVE);
+    }
+
+    // ============================================================ séparation MVSEP
+    private void startSeparation() {
+        if (busy) { toast("Une tâche est en cours"); return; }
+        final String token = prefs.getString("token", "").trim();
+        String st = prefs.getString("sep_type", "20").trim();
+        final String sepType = st.isEmpty() ? "20" : st;
+        final String opt1 = prefs.getString("opt1", "").trim();
+        if (token.isEmpty()) { toast("Ajoutez d'abord votre clé API (Profil)"); select(3); return; }
+        if (songUri == null) { toast("Choisissez d'abord un morceau"); return; }
+        final Uri song = songUri;
+
+        busy = true;
+        sepRunning = true;
+        sepPct = 2f;
+        sepStatus = "Préparation du fichier";
+        render(false);
+
+        exec.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    File in = copyToCache(song, "input_song");
+                    sepPct = 8f; sepStatus = "Envoi à MVSEP"; postLive();
+                    String hash = MvsepClient.create(token, in, sepType, opt1);
+                    sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive();
+
+                    final int[] polls = {0};
+                    List<MvsepClient.Remote> files = MvsepClient.waitForResult(hash,
+                            new MvsepClient.Status() {
+                                @Override public void onStatus(String s) {
+                                    polls[0]++;
+                                    sepPct = 20f + 65f * (1f - (float) Math.exp(-polls[0] / 24.0));
+                                    sepStatus = s + " (estimation)";
+                                    postLive();
+                                }
+                            });
+
+                    final List<Stem> fresh = new ArrayList<>();
+                    for (int i = 0; i < files.size(); i++) {
+                        MvsepClient.Remote r = files.get(i);
+                        sepPct = 85f + 15f * i / files.size();
+                        sepStatus = "Téléchargement : " + r.name;
+                        postLive();
+                        File out = new File(getCacheDir(), "stem_" + i);
+                        MvsepClient.download(r.url, out);
+                        Stem s = new Stem(r.name, out);
+                        s.poly = guessPoly(r.name);
+                        String low = r.name.toLowerCase(Locale.ROOT);
+                        s.selected = !(low.contains("drum") || low.contains("batterie"));
+                        fresh.add(s);
+                    }
+                    sepPct = 100f;
+                    sepStatus = "Terminé";
+                    sepRunning = false;
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            stems.clear();
+                            stems.addAll(fresh);
+                            savedOnce = false;
+                            prefs.edit().putInt("sep_count", prefs.getInt("sep_count", 0) + 1).apply();
+                            render(false);
+                            toast("Séparation terminée");
+                        }
+                    });
+                } catch (Throwable e) {
+                    sepRunning = false;
+                    toastLater("Erreur : " + e.getMessage());
+                    ui.post(new Runnable() {
+                        @Override public void run() { render(false); }
+                    });
+                } finally {
+                    sepRunning = false;
+                    busy = false;
+                }
+            }
+        });
+    }
+
+    // ============================================================ transcription
+    private void startTranscription() {
+        if (busy) { toast("Une tâche est en cours"); return; }
+        final List<Stem> chosen = new ArrayList<>();
+        for (Stem s : stems) {
+            if (s.selected) {
+                s.notes = null;
+                s.pct = 0f;
+                chosen.add(s);
+            }
+        }
+        if (chosen.isEmpty()) { toast("Cochez au moins une piste"); return; }
+
+        busy = true;
+        anaRunning = true;
+        anaPct = 0f;
+        anaStatus = "Décodage";
+        render(false);
+
+        exec.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    final int n = chosen.size();
+                    int total = 0;
+                    for (int i = 0; i < n; i++) {
+                        final int idx = i;
+                        final Stem s = chosen.get(i);
+                        anaStatus = s.name + " (" + (i + 1) + "/" + n + ")";
+                        postLive();
+                        float[] pcm = AudioDecoder.decodeMono(s.file, PitchTranscriber.SAMPLE_RATE);
+                        PitchTranscriber.Progress p = new PitchTranscriber.Progress() {
+                            @Override public void onProgress(int pct) {
+                                s.pct = pct / 100f;
+                                anaPct = (idx + pct / 100f) / n;
+                                postLive();
+                            }
+                        };
+                        List<PitchTranscriber.Note> res = s.poly
+                                ? PitchTranscriber.transcribePoly(pcm, PitchTranscriber.SAMPLE_RATE, p)
+                                : PitchTranscriber.transcribeMono(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                        s.notes = res;
+                        s.pct = 1f;
+                        total += res.size();
+                    }
+                    anaPct = 1f;
+                    anaStatus = "Terminé";
+                    anaRunning = false;
+                    final int added = total;
+                    ui.post(new Runnable() {
+                        @Override public void run() {
+                            prefs.edit().putInt("notes_total", prefs.getInt("notes_total", 0) + added).apply();
+                            segment = 1;
+                            tab = 1;
+                            render(true);
+                            toast("Analyse terminée : " + added + " notes");
+                        }
+                    });
+                } catch (Throwable e) {
+                    anaRunning = false;
+                    toastLater("Erreur : " + e.getMessage());
+                    ui.post(new Runnable() {
+                        @Override public void run() { render(false); }
+                    });
+                } finally {
+                    anaRunning = false;
+                    busy = false;
+                }
+            }
+        });
+    }
+
+    // ============================================================ aides
+    private LinearLayout vbox() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        return l;
+    }
+
+    private void toast(String s) {
+        Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+    }
+
+    private void toastLater(final String s) {
+        ui.post(new Runnable() {
+            @Override public void run() { toast(s); }
+        });
+    }
+}
