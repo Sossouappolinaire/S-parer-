@@ -40,7 +40,8 @@ final class MvsepClient {
     private MvsepClient() {}
 
     /** Envoie le fichier et renvoie le "hash" de la tâche. */
-    static String create(String token, File audio, String sepType, String opt1) throws IOException {
+    static String create(String token, File audio, String sepType, String opt1, String filename)
+            throws IOException {
         String boundary = "----stemnotes" + System.currentTimeMillis();
         ByteArrayOutputStream pre = new ByteArrayOutputStream();
         field(pre, boundary, "api_token", token);
@@ -48,8 +49,8 @@ final class MvsepClient {
         if (opt1 != null && !opt1.isEmpty()) field(pre, boundary, "add_opt1", opt1);
         field(pre, boundary, "output_format", "0"); // mp3 320 kbps : léger et décodable partout
         String fileHead = "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"audiofile\"; filename=\"input\"\r\n"
-                + "Content-Type: application/octet-stream\r\n\r\n";
+                + "Content-Disposition: form-data; name=\"audiofile\"; filename=\"" + filename + "\"\r\n"
+                + "Content-Type: " + mimeFor(filename) + "\r\n\r\n";
         pre.write(fileHead.getBytes(UTF8));
         byte[] post = ("\r\n--" + boundary + "--\r\n").getBytes(UTF8);
 
@@ -143,6 +144,17 @@ final class MvsepClient {
             out.close();
             in.close();
         }
+    }
+
+    private static String mimeFor(String filename) {
+        String f = filename.toLowerCase(java.util.Locale.ROOT);
+        if (f.endsWith(".mp3")) return "audio/mpeg";
+        if (f.endsWith(".wav")) return "audio/wav";
+        if (f.endsWith(".flac")) return "audio/flac";
+        if (f.endsWith(".m4a") || f.endsWith(".mp4")) return "audio/mp4";
+        if (f.endsWith(".aac")) return "audio/aac";
+        if (f.endsWith(".ogg") || f.endsWith(".opus")) return "audio/ogg";
+        return "audio/mpeg";
     }
 
     private static void field(ByteArrayOutputStream o, String boundary, String name, String value)

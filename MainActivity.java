@@ -1121,6 +1121,25 @@ public class MainActivity extends Activity {
     }
 
     // ============================================================ séparation MVSEP
+    /** Nom de fichier avec une vraie extension audio (MVSEP refuse un fichier sans extension). */
+    private String uploadName(Uri uri) {
+        String ext = "";
+        String n = songName == null ? "" : songName;
+        int dot = n.lastIndexOf('.');
+        if (dot >= 0 && dot < n.length() - 1) ext = n.substring(dot + 1).toLowerCase(Locale.ROOT);
+        if (!ext.matches("mp3|wav|flac|m4a|mp4|aac|ogg|opus")) {
+            String t = getContentResolver().getType(uri);
+            t = t == null ? "" : t.toLowerCase(Locale.ROOT);
+            if (t.contains("wav")) ext = "wav";
+            else if (t.contains("flac")) ext = "flac";
+            else if (t.contains("mp4") || t.contains("m4a")) ext = "m4a";
+            else if (t.contains("aac")) ext = "aac";
+            else if (t.contains("ogg") || t.contains("opus")) ext = "ogg";
+            else ext = "mp3";
+        }
+        return "input." + ext;
+    }
+
     private void startSeparation() {
         if (busy) { toast("Une tâche est en cours"); return; }
         final String token = prefs.getString("token", "").trim();
@@ -1130,6 +1149,7 @@ public class MainActivity extends Activity {
         if (token.isEmpty()) { toast("Ajoutez d'abord votre clé API (Profil)"); select(3); return; }
         if (songUri == null) { toast("Choisissez d'abord un morceau"); return; }
         final Uri song = songUri;
+        final String uploadName = uploadName(song);
 
         busy = true;
         sepRunning = true;
@@ -1142,7 +1162,7 @@ public class MainActivity extends Activity {
                 try {
                     File in = copyToCache(song, "input_song");
                     sepPct = 8f; sepStatus = "Envoi à MVSEP"; postLive();
-                    String hash = MvsepClient.create(token, in, sepType, opt1);
+                    String hash = MvsepClient.create(token, in, sepType, opt1, uploadName);
                     sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive();
 
                     final int[] polls = {0};
