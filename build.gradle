@@ -14,6 +14,18 @@ android {
         versionName '1.0'
     }
 
+    // Clé de signature fixe : chaque build GitHub est signé pareil, donc l'APK
+    // s'installe par-dessus la version précédente sans « Application non installée ».
+    signingConfigs {
+        debug {
+            storeFile file('stemnotes.keystore')
+            storePassword 'stemnotes123'
+            keyAlias 'stemnotes'
+            keyPassword 'stemnotes123'
+            storeType 'pkcs12'
+        }
+    }
+
     // Tout est à la racine : manifeste + fichiers .java (pas de dossier src/).
     // Les .java sont copiés dans build/generated/flatjava avant la compilation :
     // déclarer la racine comme dossier source fait entrer en conflit les tâches Gradle.
