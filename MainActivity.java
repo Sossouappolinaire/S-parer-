@@ -1,6 +1,7 @@
 package com.stemnotes;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
@@ -50,6 +51,7 @@ public class MainActivity extends Activity {
     private static final int REQ_SONG = 1;
     private static final int REQ_STEM = 2;
     private static final int REQ_SAVE = 3;
+    private static final int REQ_PERM = 4;
 
     private static final int M = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int W = ViewGroup.LayoutParams.WRAP_CONTENT;
@@ -89,6 +91,7 @@ public class MainActivity extends Activity {
 
     // vues du lecteur (nulles si non affichées)
     private NoteRollView roll;
+    private final List<View> instViews = new ArrayList<>(); // clavier piano / basse du lecteur
     private TextView clockLabel, rollNow, lyPrev, lyCur, lyNext, playAllBtn;
     private SeekBar seek;
     private boolean seeking = false;
@@ -131,6 +134,11 @@ public class MainActivity extends Activity {
     private String songName = "";
     private byte[] pendingMidi;
     private boolean savedOnce = false;
+    private String stemsTitle = "";          // titre du morceau dont viennent les pistes
+    private volatile boolean saving = false;
+    private boolean stemsSaved = false;      // les pistes affichées sont déjà dans Separonsta
+    private List<StemStore.Song> savedSongs = new ArrayList<>(); // morceaux déjà séparés (Separonsta)
+    private Runnable pendingAfterPerm;
     private int importCounter = 0;
 
     private volatile boolean busy = false;
@@ -214,6 +222,169 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         pauseAll();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshSavedSongs();
+    }
+
+    /** Relit la liste des morceaux déjà séparés (en arrière-plan) et réaffiche l'accueil si elle a changé. */
+    private void refreshSavedSongs() {
+        exec.execute(new Runnable() {
+            @Override public void run() {
+                final List<StemStore.Song> now = StemStore.listSongs(getApplicationContext());
+                boolean same = now.size() == savedSongs.size();
+                for (int i = 0; same && i < now.size(); i++) {
+                    same = now.get(i).title.equals(savedSongs.get(i).title) && now.get(i).count == savedSongs.get(i).count;
+                }
+                if (same) return;
+                ui.post(new Runnable() {
+                    @Override public void run() {
+                        savedSongs = now;
+                        if ((tab == 0 || (tab == 1 && segment == 0)) && mix.isEmpty() && !sepRunning && !anaRunning) {
+                            render(false);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // ============================================================ nouvelle séparation
+    private boolean hasUnsavedStems() {
+        if (stemsSaved) return false;
+        for (Stem x : stems) if (!x.name.equals("Morceau complet")) return true;
+        return false;
+    }
+
+    /** Repart de zéro : on peut choisir un nouveau morceau à séparer. */
+    private void newSeparation() {
+        if (busy || sepRunning || anaRunning) { toast("Une tâche est en cours"); return; }
+        if (hasUnsavedStems()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Nouvelle séparation")
+                    .setMessage("Les pistes actuelles (et leurs notes) ne sont pas enregistrées dans Separonsta. "
+                            + "Les retirer de l'écran quand même ?\n\nAstuce : « Télécharger les pistes » les garde "
+                            + "dans la liste des morceaux déjà séparés.")
+                    .setPositiveButton("Continuer", new android.content.DialogInterface.OnClickListener() {
+                        @Override public void onClick(android.content.DialogInterface d, int w) { resetForNewSeparation(); }
+                    })
+                    .setNegativeButton("Annuler", null)
+                    .show();
+        } else {
+            resetForNewSeparation();
+        }
+    }
+
+    private void resetForNewSeparation() {
+        stopPlayback();
+        stems.clear();
+        seenDone.clear();
+        songUri = null;
+        songName = "";
+        stemsTitle = "";
+        savedOnce = false;
+        stemsSaved = false;
+        pendingMidi = null;
+        segment = 0;
+        tab = 0;
+        render(true);
+        pickAudio(REQ_SONG);
+    }
+
+    /** Charge un morceau déjà séparé (dossier Separonsta) : analyse, notes, MIDI… sans nouvelle séparation. */
+    private void openSavedSong(final String title) {
+        if (busy) { toast("Une tâche est en cours"); return; }
+        if (hasUnsavedStems()) {
+            new AlertDialog.Builder(this)
+                    .setTitle(title)
+                    .setMessage("Les pistes affichées ne sont pas enregistrées dans Separonsta. Les remplacer par ce morceau ?")
+                    .setPositiveButton("Remplacer", new android.content.DialogInterface.OnClickListener() {
+                        @Override public void onClick(android.content.DialogInterface d, int w) { loadSavedSong(title); }
+                    })
+                    .setNegativeButton("Annuler", null)
+                    .show();
+        } else {
+            loadSavedSong(title);
+        }
+    }
+
+    private void loadSavedSong(final String title) {
+        if (busy) { toast("Une tâche est en cours"); return; }
+        busy = true;
+        sepRunning = true;
+        sepPct = 5f;
+        sepStatus = "Chargement de " + title;
+        render(false);
+        exec.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    List<Stem> found = readSavedStems(title);
+                    if (found.isEmpty()) throw new Exception("aucune piste trouvée pour " + title);
+                    sepPct = 100f; sepStatus = "Terminé"; sepRunning = false;
+                    finishSeparation(found, title, "Morceau chargé : " + title, true);
+                } catch (Throwable e) {
+                    sepRunning = false;
+                    toastLater("Erreur : " + e.getMessage());
+                    ui.post(new Runnable() {
+                        @Override public void run() { render(false); }
+                    });
+                } finally {
+                    sepRunning = false;
+                    busy = false;
+                }
+            }
+        });
+    }
+
+    /** Relit les pistes enregistrées d'un morceau vers le cache de l'app. */
+    private List<Stem> readSavedStems(String title) throws Exception {
+        List<StemStore.Entry> saved = StemStore.list(getApplicationContext(), title);
+        List<Stem> found = new ArrayList<>();
+        for (int i = 0; i < saved.size(); i++) {
+            StemStore.Entry e = saved.get(i);
+            File f = new File(getCacheDir(), "stem_" + i);
+            StemStore.copyTo(getApplicationContext(), e.uri, f);
+            Stem st = new Stem(e.instrument, f);
+            st.poly = guessPoly(e.instrument);
+            String low = e.instrument.toLowerCase(Locale.ROOT);
+            st.selected = !(low.contains("drum") || low.contains("batterie"));
+            found.add(st);
+            sepPct = 10f + 90f * (i + 1) / saved.size();
+            postLive();
+        }
+        return found;
+    }
+
+    /** Carte « Morceaux déjà séparés » : un appui charge le morceau. */
+    private View savedSongsCard() {
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+        card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(8));
+        card.addView(Ui.text(this, "Morceaux déjà séparés", 16, Ui.INK, true));
+        card.addView(Ui.text(this, "Touchez un morceau pour le rouvrir sans le séparer à nouveau.", 11, Ui.MUTED, false),
+                Ui.lp(M, W, 0, 3, 0, 6));
+        for (final StemStore.Song so : savedSongs) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, Ui.dp(10), 0, Ui.dp(10));
+            LinearLayout t = vbox();
+            t.addView(Ui.text(this, so.title, 14, Ui.INK, true));
+            boolean current = !stems.isEmpty() && !stemsTitle.isEmpty() && so.title.equals(StemStore.safe(stemsTitle));
+            t.addView(Ui.text(this, so.count + " piste(s)" + (current ? " · affiché" : ""), 11, Ui.MUTED, false),
+                    Ui.lp(W, W, 0, 2, 0, 0));
+            row.addView(t, new LinearLayout.LayoutParams(0, W, 1f));
+            row.addView(new IconView(this, IconView.ARROW, Ui.INK), new LinearLayout.LayoutParams(Ui.dp(18), Ui.dp(18)));
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { openSavedSong(so.title); }
+            });
+            Ui.pressable(row);
+            card.addView(row, new LinearLayout.LayoutParams(M, W));
+        }
+        return card;
     }
 
     // ============================================================ lecture (une piste seule ou plusieurs ensemble)
@@ -441,6 +612,10 @@ public class MainActivity extends Activity {
                 }
             }
         }
+        for (View v : instViews) {
+            if (v instanceof PianoView) ((PianoView) v).setTime(sec);
+            else if (v instanceof BassView) ((BassView) v).setTime(sec);
+        }
         if (force || tickCount % 15 == 0) {
             if (clockLabel != null) clockLabel.setText(fmtTime(pos) + " / " + fmtTime(durMs()));
             if (seek != null && !seeking) seek.setProgress(pos);
@@ -453,11 +628,11 @@ public class MainActivity extends Activity {
 
     /** Tonalité unique du morceau, calculée sur toutes les pistes mélodiques ensemble. */
     private String songKey() {
-        List<PitchTranscriber.Note> all = new ArrayList<>();
+        List<List<PitchTranscriber.Note>> all = new ArrayList<>();
         for (Stem x : stems) {
-            if (x.notes != null && !isDrums(x)) all.addAll(x.notes);
+            if (x.notes != null && !isDrums(x)) all.add(x.notes);
         }
-        return PitchTranscriber.detectKey(all);
+        return PitchTranscriber.detectKeyMulti(all);
     }
 
     private static boolean isDrums(Stem x) {
@@ -516,6 +691,27 @@ public class MainActivity extends Activity {
             card.addView(roll, new LinearLayout.LayoutParams(M, Ui.dp(180)));
             rollNow = Ui.text(this, "…", 12, Ui.INK, true);
             card.addView(rollNow, Ui.lp(M, W, 0, 6, 0, 0));
+
+            // clavier de piano (avec un doigt) et guitare basse : notes jouées en temps réel
+            for (NoteRollView.Track tr : tracks) {
+                String ln = tr.name.toLowerCase(Locale.ROOT);
+                View inst = null;
+                int hDp = 0;
+                String title = "";
+                if (ln.contains("piano")) {
+                    inst = new PianoView(this, tr);
+                    hDp = 150;
+                    title = "🎹 " + tr.name;
+                } else if (ln.contains("basse") || ln.contains("bass")) {
+                    inst = new BassView(this, tr);
+                    hDp = 130;
+                    title = "🎸 " + tr.name;
+                }
+                if (inst == null) continue;
+                card.addView(Ui.text(this, title, 12, Ui.MUTED, true), Ui.lp(M, W, 0, 10, 0, 4));
+                card.addView(inst, new LinearLayout.LayoutParams(M, Ui.dp(hDp)));
+                instViews.add(inst);
+            }
         } else {
             card.addView(Ui.text(this, "Extrayez les notes de ces pistes (bouton orange plus bas) pour les voir défiler.",
                     12, Ui.MUTED, false), Ui.lp(M, W, 0, 0, 0, 4));
@@ -638,6 +834,7 @@ public class MainActivity extends Activity {
         homeSepText = null; homeAnaText = null; progressLabel = null; extractLabel = null;
         homeArt1 = null; homeArt2 = null;
         for (Stem s : stems) { s.bar = null; s.pctLabel = null; s.playLabel = null; s.mixLabel = null; }
+        instViews.clear();
         roll = null; rollNow = null; clockLabel = null; lyPrev = null; lyCur = null; lyNext = null;
         playAllBtn = null; seek = null; lyIdx = -2; lastNow = "";
 
@@ -774,9 +971,14 @@ public class MainActivity extends Activity {
                 @Override public void onClick(View v) { startSeparation(); }
             });
         } else {
-            btn1 = pillButton("Terminé · voir les pistes", -1, true, new View.OnClickListener() {
+            LinearLayout two = vbox();
+            two.addView(pillButton("Terminé · voir les pistes", -1, true, new View.OnClickListener() {
                 @Override public void onClick(View v) { openReview(0); }
-            });
+            }));
+            two.addView(pillButton("Nouvelle séparation", IconView.PLUS, true, new View.OnClickListener() {
+                @Override public void onClick(View v) { newSeparation(); }
+            }), Ui.lp(M, W, 0, 8, 0, 0));
+            btn1 = two;
         }
         homeArt1 = new ArtView(this, Ui.YELLOW_BORDER, Ui.WHITE);
         homeArt1.setActive(sepRunning);
@@ -790,7 +992,7 @@ public class MainActivity extends Activity {
                     @Override public void onClick(View v) { select(3); }
                 }));
         col.addView(sectionRow("u1b", 2, "Morceau",
-                songUri != null ? songName : (songOk ? "Piste importée" : "Choisir un fichier audio"),
+                songUri != null ? songName : (songOk ? (!stemsTitle.isEmpty() ? stemsTitle : "Piste importée") : "Choisir un fichier audio"),
                 stateOf(songOk, tokenOk), false, null, new View.OnClickListener() {
                     @Override public void onClick(View v) { pickAudio(REQ_SONG); }
                 }));
@@ -800,6 +1002,10 @@ public class MainActivity extends Activity {
                 sepRunning ? 1 : stateOf(sepOk, tokenOk && songOk), true, sepExtra, new View.OnClickListener() {
                     @Override public void onClick(View v) { startSeparation(); }
                 }));
+
+        if (!savedSongs.isEmpty()) {
+            col.addView(savedSongsCard(), Ui.lp(M, W, 0, 4, 0, 4));
+        }
 
         // ---- Unité 2 : extraction des notes
         boolean unlocked2 = !stems.isEmpty();
@@ -1128,6 +1334,13 @@ public class MainActivity extends Activity {
         }
 
         if (!stems.isEmpty()) {
+            col.addView(pillButtonYellow(saving ? "Enregistrement…" : "Télécharger les pistes (dossier Separonsta)",
+                    new View.OnClickListener() {
+                        @Override public void onClick(View v) { downloadStems(); }
+                    }), Ui.lp(M, W, 0, 0, 0, 4));
+            col.addView(Ui.text(this, "Chaque piste est enregistrée en MP3 dans Musique/Separonsta/<titre>/<instrument>. "
+                    + "Si vous rajoutez le même morceau, elles sont relues sans nouvelle séparation.", 11, Ui.MUTED, false),
+                    Ui.lp(M, W, 0, 0, 0, 12));
             TextView b = Ui.text(this, extractText(), 15, Ui.WHITE, true);
             b.setGravity(Gravity.CENTER);
             b.setBackground(Ui.box(anaRunning ? 0xFFF0B48C : Ui.ORANGE, 18, 0, 0));
@@ -1140,6 +1353,13 @@ public class MainActivity extends Activity {
             }
             extractLabel = b;
             col.addView(b, Ui.lp(M, W, 0, 6, 0, 0));
+        }
+
+        col.addView(pillButtonYellow("Nouvelle séparation", new View.OnClickListener() {
+            @Override public void onClick(View v) { newSeparation(); }
+        }), Ui.lp(M, W, 0, 12, 0, 0));
+        if (!savedSongs.isEmpty()) {
+            col.addView(savedSongsCard(), Ui.lp(M, W, 0, 14, 0, 0));
         }
 
         for (final Stem s : stems) {
@@ -1581,6 +1801,7 @@ public class MainActivity extends Activity {
                         ui.post(new Runnable() {
                             @Override public void run() {
                                 stems.add(new Stem(name, f));
+                                stemsSaved = false;
                                 stems.get(stems.size() - 1).poly = guessPoly(name);
                                 render(false);
                                 toast("Piste importée : " + name);
@@ -1614,7 +1835,9 @@ public class MainActivity extends Activity {
         String low = name.toLowerCase(Locale.ROOT);
         return low.contains("piano") || low.contains("other") || low.contains("guitar")
                 || low.contains("guitare") || low.contains("key") || low.contains("instrum")
-                || low.contains("music");
+                || low.contains("music") || low.contains("clavier") || low.contains("synth")
+                || low.contains("orgue") || low.contains("organ") || low.contains("cordes")
+                || low.contains("string") || low.contains("autres");
     }
 
     private String displayName(Uri uri) {
@@ -1765,6 +1988,7 @@ public class MainActivity extends Activity {
         if (songUri == null) { toast("Choisissez d'abord un morceau"); return; }
         final Uri song = songUri;
         final String uploadName = uploadName(song);
+        final String title = StemStore.titleOf(songName);
 
         busy = true;
         sepRunning = true;
@@ -1776,6 +2000,16 @@ public class MainActivity extends Activity {
         exec.execute(new Runnable() {
             @Override public void run() {
                 try {
+                    // Même morceau déjà téléchargé dans Separonsta : on relit les pistes au lieu de les séparer
+                    List<StemStore.Entry> saved = StemStore.list(getApplicationContext(), title);
+                    if (!saved.isEmpty()) {
+                        sepStatus = "Pistes retrouvées dans Separonsta"; sepPct = 10f; postLive();
+                        List<Stem> found = readSavedStems(title);
+                        sepPct = 100f; sepStatus = "Terminé"; sepRunning = false;
+                        finishSeparation(found, title, "Pistes retrouvées dans Separonsta : pas de nouvelle séparation", true);
+                        return;
+                    }
+
                     File in = copyToCache(song, "input_song");
 
                     // MVSEP refuse tout ce qui n'est pas un vrai fichier audio : on vérifie le format réel
@@ -1834,21 +2068,11 @@ public class MainActivity extends Activity {
                         if (why.length() > 110) why = why.substring(0, 110) + "…";
                         planB[0] = "MVSEP indisponible (" + why + ") : le morceau complet est analysé à la place";
                     }
-                    final List<Stem> result = fresh;
                     sepPct = 100f;
                     sepStatus = "Terminé";
                     sepRunning = false;
-                    ui.post(new Runnable() {
-                        @Override public void run() {
-                            stopPlayback();
-                            stems.clear();
-                            stems.addAll(result);
-                            savedOnce = false;
-                            prefs.edit().putInt("sep_count", prefs.getInt("sep_count", 0) + 1).apply();
-                            render(false);
-                            toast(planB[0] != null ? planB[0] : "Séparation terminée");
-                        }
-                    });
+                    finishSeparation(fresh, planB[0] != null ? "" : title,
+                            planB[0] != null ? planB[0] : "Séparation terminée", false);
                 } catch (Throwable e) {
                     sepRunning = false;
                     toastLater("Erreur : " + e.getMessage());
@@ -1861,6 +2085,90 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    private void finishSeparation(final List<Stem> result, final String title, final String message, final boolean alreadySaved) {
+        ui.post(new Runnable() {
+            @Override public void run() {
+                stopPlayback();
+                stems.clear();
+                stems.addAll(result);
+                stemsTitle = title;
+                savedOnce = false;
+                stemsSaved = alreadySaved;
+                seenDone.clear();
+                segment = 0;
+                prefs.edit().putInt("sep_count", prefs.getInt("sep_count", 0) + 1).apply();
+                render(false);
+                toast(message);
+            }
+        });
+    }
+
+    // ============================================================ téléchargement dans Separonsta
+    /** Enregistre chaque piste en MP3 : Musique/Separonsta/<titre>/<instrument>/<instrument>.mp3 */
+    private void downloadStems() {
+        if (stems.isEmpty() || saving) return;
+        if (Build.VERSION.SDK_INT < 29
+                && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            pendingAfterPerm = new Runnable() {
+                @Override public void run() { downloadStems(); }
+            };
+            requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_PERM);
+            return;
+        }
+        final String title = !stemsTitle.isEmpty() ? stemsTitle
+                : (songName.isEmpty() ? "Morceau importé" : StemStore.titleOf(songName));
+        final List<Stem> todo = new ArrayList<>();
+        for (Stem x : stems) {
+            if (x.file != null && x.file.exists() && !x.name.equals("Morceau complet")) todo.add(x);
+        }
+        if (todo.isEmpty()) { toast("Aucune piste à enregistrer"); return; }
+        saving = true;
+        render(false);
+        toast("Enregistrement de " + todo.size() + " piste(s)…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                int ok = 0;
+                String err = "";
+                Set<String> used = new HashSet<>();
+                for (Stem x : todo) {
+                    String inst = StemStore.safe(x.name);
+                    String base = inst;
+                    for (int k = 2; used.contains(inst.toLowerCase(Locale.ROOT)); k++) inst = base + " " + k;
+                    used.add(inst.toLowerCase(Locale.ROOT));
+                    try {
+                        StemStore.save(getApplicationContext(), title, inst, x.file);
+                        ok++;
+                    } catch (Throwable e) {
+                        err = String.valueOf(e.getMessage());
+                    }
+                }
+                saving = false;
+                if (ok == todo.size()) stemsSaved = true;
+                toastLater(ok == todo.size()
+                        ? ok + " piste(s) enregistrée(s) dans Musique/" + StemStore.ROOT + "/" + title
+                        : ok + "/" + todo.size() + " enregistrée(s). Erreur : " + err);
+                ui.post(new Runnable() {
+                    @Override public void run() { render(false); }
+                });
+                refreshSavedSongs();
+            }
+        }).start();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(code, perms, res);
+        if (code != REQ_PERM) return;
+        Runnable r = pendingAfterPerm;
+        pendingAfterPerm = null;
+        if (res.length > 0 && res[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (r != null) r.run();
+        } else {
+            toast("Autorisation refusée : impossible d'enregistrer sur le téléphone");
+        }
     }
 
     // ============================================================ transcription
@@ -1913,6 +2221,15 @@ public class MainActivity extends Activity {
                                     ? PitchTranscriber.transcribePoly(pcm, PitchTranscriber.SAMPLE_RATE, p)
                                     : PitchTranscriber.transcribeMono(pcm, PitchTranscriber.SAMPLE_RATE, p);
                             s.engine = "détection intégrée";
+                            if (s.poly && res.size() < 8) {
+                                // le mode polyphonique ne trouve presque rien : on essaie la mélodie seule
+                                List<PitchTranscriber.Note> mono =
+                                        PitchTranscriber.transcribeMono(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                                if (mono.size() > res.size()) {
+                                    res = mono;
+                                    s.engine = "détection intégrée (mélodie)";
+                                }
+                            }
                         }
                         s.notes = res;
                         s.pct = 1f;

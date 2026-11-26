@@ -10,8 +10,8 @@ android {
         applicationId 'com.stemnotes.app2' // nouvel identifiant : s'installe à côté de l'ancienne version, sans conflit de signature
         minSdk 24
         targetSdk 34
-        versionCode 3
-        versionName '1.2'
+        versionCode 4
+        versionName '1.3'
     }
 
     // Clé de signature fixe : chaque build GitHub est signé pareil, donc l'APK

@@ -255,6 +255,8 @@ final class PitchTranscriber {
         }
         if (maxRms < 1e-4) return notes;
         double gate = Math.max(0.08 * maxRms, 1e-4);
+        // Piste très faible (cas fréquent du piano séparé) : on la remet à un niveau standard
+        final double norm = Math.min(200.0, 0.2 / maxRms);
 
         double[] win = new double[N];
         for (int i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
@@ -288,7 +290,7 @@ final class PitchTranscriber {
             }
             fft.transform(re, im, false);
             for (int k = 0; k <= N / 2; k++) {
-                mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]) * 4.0 / N;
+                mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]) * 4.0 / N * norm;
             }
 
             double first = 0;
@@ -383,18 +385,39 @@ final class PitchTranscriber {
 
     /** Tonalité estimée (algorithme de Krumhansl-Schmuckler), par ex. « Fa majeur » ou « Mi mineur ». */
     static String detectKey(List<Note> notes) {
-        if (notes == null || notes.size() < 4) return "indéterminée";
-        double[] h = new double[12];
-        for (Note n : notes) {
-            h[((n.pitch % 12) + 12) % 12] += Math.max(0.05, n.end - n.start);
+        List<List<Note>> one = new ArrayList<>();
+        one.add(notes);
+        return detectKeyMulti(one);
+    }
+
+    /**
+     * Une seule tonalité pour plusieurs instruments : chaque piste compte autant que les autres
+     * (une piste bruitée ou très dense, comme un piano mal détecté, ne peut pas tirer la tonalité à elle seule).
+     */
+    static String detectKeyMulti(List<List<Note>> tracks) {
+        double[] total = new double[12];
+        int used = 0;
+        for (List<Note> notes : tracks) {
+            if (notes == null || notes.size() < 4) continue;
+            double[] h = new double[12];
+            double sum = 0;
+            for (Note n : notes) {
+                double w = Math.max(0.05, n.end - n.start) * (0.4 + 0.6 * n.velocity / 127.0);
+                h[((n.pitch % 12) + 12) % 12] += w;
+                sum += w;
+            }
+            if (sum <= 0) continue;
+            for (int i = 0; i < 12; i++) total[i] += h[i] / sum;
+            used++;
         }
+        if (used == 0) return "indéterminée";
         double best = -2;
         int bestTonic = 0;
         boolean bestMajor = true;
         for (int t = 0; t < 12; t++) {
             for (int m = 0; m < 2; m++) {
                 double[] prof = m == 0 ? KEY_MAJOR : KEY_MINOR;
-                double r = correlation(h, prof, t);
+                double r = correlation(total, prof, t);
                 if (r > best) {
                     best = r;
                     bestTonic = t;
