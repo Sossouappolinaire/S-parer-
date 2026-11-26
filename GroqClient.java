@@ -95,7 +95,7 @@ final class GroqClient {
                     if (t.isEmpty()) continue;
                     double st = s.optDouble("start", 0);
                     int min = (int) (st / 60);
-                    sb.append(String.format(Locale.US, "%d:%02d  %s\n", min, (int) (st - min * 60), t));
+                    sb.append(String.format(Locale.US, "%d:%04.1f  %s\n", min, st - min * 60, t));
                 }
                 return sb.toString().trim();
             }

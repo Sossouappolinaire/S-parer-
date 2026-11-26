@@ -10,8 +10,8 @@ android {
         applicationId 'com.stemnotes.app2' // nouvel identifiant : s'installe à côté de l'ancienne version, sans conflit de signature
         minSdk 24
         targetSdk 34
-        versionCode 2
-        versionName '1.1'
+        versionCode 3
+        versionName '1.2'
     }
 
     // Clé de signature fixe : chaque build GitHub est signé pareil, donc l'APK
@@ -48,10 +48,6 @@ android {
     }
 }
 
-dependencies {
-    // Basic Pitch (transcription des notes sur le téléphone)
-    implementation 'org.tensorflow:tensorflow-lite:2.16.1'
-}
 
 def copyJavaSources = tasks.register('copyJavaSources', Copy) {
     from(projectDir) {

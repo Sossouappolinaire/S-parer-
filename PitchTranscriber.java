@@ -405,6 +405,42 @@ final class PitchTranscriber {
         return NAMES[bestTonic] + (bestMajor ? " majeur" : " mineur");
     }
 
+    /** Notes (0..11) appartenant à la gamme de la tonalité donnée (ex. « Fa majeur »), ou null si indéterminée. */
+    static boolean[] keyScale(String key) {
+        if (key == null) return null;
+        int tonic = -1;
+        int bestLen = 0;
+        for (int i = 0; i < NAMES.length; i++) {
+            if (key.startsWith(NAMES[i] + " ") && NAMES[i].length() > bestLen) {
+                tonic = i;
+                bestLen = NAMES[i].length();
+            }
+        }
+        if (tonic < 0) return null;
+        int[] steps = key.endsWith("mineur") ? new int[]{0, 2, 3, 5, 7, 8, 10} : new int[]{0, 2, 4, 5, 7, 9, 11};
+        boolean[] sc = new boolean[12];
+        for (int st : steps) sc[(tonic + st) % 12] = true;
+        return sc;
+    }
+
+    /** Ramène chaque note hors tonalité sur la note de la gamme la plus proche (même tonalité pour tous les instruments). */
+    static List<Note> snapToKey(List<Note> notes, String key) {
+        boolean[] sc = keyScale(key);
+        if (sc == null || notes == null) return notes;
+        List<Note> out = new ArrayList<>(notes.size());
+        for (Note n : notes) {
+            int p = n.pitch;
+            if (!sc[((p % 12) + 12) % 12]) {
+                for (int d = 1; d <= 2; d++) {
+                    if (sc[(((p - d) % 12) + 12) % 12]) { p = p - d; break; }
+                    if (sc[(((p + d) % 12) + 12) % 12]) { p = p + d; break; }
+                }
+            }
+            out.add(p == n.pitch ? n : new Note(p, n.start, n.end, n.velocity));
+        }
+        return out;
+    }
+
     private static double correlation(double[] h, double[] prof, int tonic) {
         double mh = 0, mp = 0;
         for (int i = 0; i < 12; i++) {

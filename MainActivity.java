@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.content.res.ColorStateList;
 import android.graphics.Typeface;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,19 +24,24 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -62,6 +69,8 @@ public class MainActivity extends Activity {
         volatile float pct;
         BarView bar;
         TextView pctLabel;
+        TextView playLabel;
+        TextView mixLabel;
 
         Stem(String name, File file) {
             this.name = name;
@@ -71,6 +80,38 @@ public class MainActivity extends Activity {
 
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
+    // lecture : une ou plusieurs pistes jouées ensemble, synchronisées
+    private final LinkedHashMap<Stem, MediaPlayer> mix = new LinkedHashMap<>();
+    private boolean mixPaused = false;
+    private int tickCount = 0;
+    private static final int[] STEM_COLORS = {0xFFE8590C, 0xFF2F9E44, 0xFF1C7ED6, 0xFFAE3EC9,
+            0xFFF59F00, 0xFFD6336C, 0xFF0CA678, 0xFF5C7CFA};
+
+    // vues du lecteur (nulles si non affichées)
+    private NoteRollView roll;
+    private TextView clockLabel, rollNow, lyPrev, lyCur, lyNext, playAllBtn;
+    private SeekBar seek;
+    private boolean seeking = false;
+    private int lyIdx = -2;
+    private String lastNow = "";
+    private String lyCacheSrc = null;
+    private List<LyricLine> lyCache = new ArrayList<>();
+
+    private static final class LyricLine {
+        final double t;
+        final String text;
+        LyricLine(double t, String text) { this.t = t; this.text = text; }
+    }
+
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() {
+            if (mix.isEmpty()) return;
+            tickCount++;
+            if (!mixPaused && tickCount % 30 == 0) resync();
+            updateLive(false);
+            if (!mixPaused) ui.postDelayed(this, 33);
+        }
+    };
     private final List<Stem> stems = new ArrayList<>();
     private final Set<String> seenDone = new HashSet<>();
     private final int[] scrollYs = new int[4];
@@ -165,7 +206,374 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        stopPlayback();
         exec.shutdownNow();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        pauseAll();
+    }
+
+    // ============================================================ lecture (une piste seule ou plusieurs ensemble)
+    private static String fmtTime(int ms) {
+        int sec = Math.max(0, ms / 1000);
+        return String.format(Locale.US, "%d:%02d", sec / 60, sec % 60);
+    }
+
+    private static boolean isPlayingSafe(MediaPlayer p) {
+        try { return p.isPlaying(); } catch (Exception e) { return false; }
+    }
+
+    private int posMs() {
+        int m = 0;
+        for (MediaPlayer p : mix.values()) {
+            try { m = Math.max(m, p.getCurrentPosition()); } catch (Exception ignored) { }
+        }
+        return m;
+    }
+
+    private int durMs() {
+        int m = 0;
+        for (MediaPlayer p : mix.values()) {
+            try { m = Math.max(m, p.getDuration()); } catch (Exception ignored) { }
+        }
+        return m;
+    }
+
+    private String playText(Stem s) {
+        if (mix.size() == 1 && mix.containsKey(s)) {
+            String t = fmtTime(posMs()) + " / " + fmtTime(durMs());
+            return (mixPaused ? "▶ Reprendre · " : "⏸ Pause · ") + t;
+        }
+        return "▶ Écouter seul";
+    }
+
+    private String mixText(Stem s) {
+        return mix.containsKey(s) ? "✓ Dans le mix (retirer)" : "+ Jouer avec le mix";
+    }
+
+    private void stopPlayback() {
+        ui.removeCallbacks(ticker);
+        for (MediaPlayer p : mix.values()) {
+            try { p.stop(); } catch (Exception ignored) { }
+            try { p.release(); } catch (Exception ignored) { }
+        }
+        mix.clear();
+        mixPaused = false;
+    }
+
+    private void pauseAll() {
+        if (mix.isEmpty()) return;
+        for (MediaPlayer p : mix.values()) {
+            try { if (p.isPlaying()) p.pause(); } catch (Exception ignored) { }
+        }
+        mixPaused = true;
+        ui.removeCallbacks(ticker);
+    }
+
+    private void resumeAll() {
+        for (MediaPlayer p : mix.values()) {
+            try { p.start(); } catch (Exception ignored) { }
+        }
+        mixPaused = false;
+        ui.removeCallbacks(ticker);
+        ui.post(ticker);
+    }
+
+    /** Remet d'aplomb les pistes qui dérivent légèrement les unes par rapport aux autres. */
+    private void resync() {
+        MediaPlayer ref = null;
+        for (MediaPlayer p : mix.values()) {
+            if (isPlayingSafe(p)) { ref = p; break; }
+        }
+        if (ref == null) return;
+        try {
+            int rp = ref.getCurrentPosition();
+            for (MediaPlayer p : mix.values()) {
+                if (p == ref || !isPlayingSafe(p)) continue;
+                if (Math.abs(p.getCurrentPosition() - rp) > 120) p.seekTo(rp);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void seekAll(int ms) {
+        for (MediaPlayer p : mix.values()) {
+            try { p.seekTo(Math.min(ms, p.getDuration())); } catch (Exception ignored) { }
+        }
+    }
+
+    /** Ajoute une piste à la lecture, calée sur la position actuelle des autres. */
+    private boolean addPlayer(final Stem s, int atMs) {
+        if (s.file == null || !s.file.exists()) { toast("Fichier audio introuvable"); return false; }
+        MediaPlayer mp = new MediaPlayer();
+        try {
+            FileInputStream fis = new FileInputStream(s.file);
+            try {
+                mp.setDataSource(fis.getFD());
+            } finally {
+                fis.close();
+            }
+            mp.prepare();
+            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                @Override public void onCompletion(MediaPlayer m) {
+                    for (MediaPlayer o : mix.values()) {
+                        if (o != m && isPlayingSafe(o)) return; // une autre piste continue
+                    }
+                    stopPlayback();
+                    render(false);
+                }
+            });
+            mix.put(s, mp);
+            if (atMs > 0) {
+                final MediaPlayer fmp = mp;
+                mp.setOnSeekCompleteListener(new MediaPlayer.OnSeekCompleteListener() {
+                    @Override public void onSeekComplete(MediaPlayer m) {
+                        m.setOnSeekCompleteListener(null);
+                        if (!mixPaused && mix.containsValue(fmp)) {
+                            try { m.start(); } catch (Exception ignored) { }
+                        }
+                    }
+                });
+                mp.seekTo(Math.min(atMs, mp.getDuration()));
+            } else if (!mixPaused) {
+                mp.start();
+            }
+            return true;
+        } catch (Exception e) {
+            mix.remove(s);
+            try { mp.release(); } catch (Exception ignored) { }
+            toast("Lecture impossible : " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** « Écouter seul » : joue uniquement cette piste (ou met en pause / reprend si elle joue déjà seule). */
+    private void togglePlay(final Stem s) {
+        if (mix.size() == 1 && mix.containsKey(s)) {
+            if (mixPaused) resumeAll(); else pauseAll();
+            render(false);
+            return;
+        }
+        stopPlayback();
+        addPlayer(s, 0);
+        render(false);
+        ui.post(ticker);
+    }
+
+    /** Ajoute ou retire une piste du mix en cours : les pistes jouent ensemble, au même endroit. */
+    private void toggleMix(Stem s) {
+        if (mix.containsKey(s)) {
+            MediaPlayer p = mix.remove(s);
+            try { p.stop(); } catch (Exception ignored) { }
+            try { p.release(); } catch (Exception ignored) { }
+            if (mix.isEmpty()) stopPlayback();
+        } else if (mix.isEmpty()) {
+            mixPaused = false;
+            addPlayer(s, 0);
+        } else {
+            addPlayer(s, posMs());
+        }
+        render(false);
+        ui.removeCallbacks(ticker);
+        if (!mix.isEmpty() && !mixPaused) ui.post(ticker);
+    }
+
+    private void togglePauseAll() {
+        if (mix.isEmpty()) return;
+        if (mixPaused) resumeAll(); else pauseAll();
+        render(false);
+    }
+
+    // ------------------------------------------------------------ paroles synchronisées
+    private List<LyricLine> lyricLines() {
+        Stem src = null;
+        for (Stem x : stems) {
+            if (x.lyrics != null && mix.containsKey(x)) { src = x; break; }
+        }
+        if (src == null) {
+            for (Stem x : stems) if (x.lyrics != null) { src = x; break; }
+        }
+        if (src == null) return new ArrayList<>();
+        if (src.lyrics.equals(lyCacheSrc)) return lyCache;
+        List<LyricLine> out = new ArrayList<>();
+        Pattern pat = Pattern.compile("^(\\d+):(\\d{1,2}(?:\\.\\d+)?)\\s+(.*)$");
+        for (String line : src.lyrics.split("\n")) {
+            Matcher m = pat.matcher(line.trim());
+            if (m.matches()) {
+                double t = Integer.parseInt(m.group(1)) * 60 + Double.parseDouble(m.group(2));
+                out.add(new LyricLine(t, m.group(3)));
+            }
+        }
+        lyCacheSrc = src.lyrics;
+        lyCache = out;
+        return out;
+    }
+
+    private void updateLyrics(double sec, boolean force) {
+        if (lyCur == null) return;
+        List<LyricLine> lines = lyricLines();
+        int idx = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).t <= sec + 0.15) idx = i; else break;
+        }
+        if (!force && idx == lyIdx) return;
+        lyIdx = idx;
+        lyPrev.setText(idx >= 1 ? lines.get(idx - 1).text : "");
+        lyCur.setText(idx >= 0 ? lines.get(idx).text : "♪");
+        lyNext.setText(idx + 1 < lines.size() ? lines.get(idx + 1).text : "");
+    }
+
+    /** Met à jour les vues du lecteur (défilé, horloge, paroles, boutons). */
+    private void updateLive(boolean force) {
+        if (mix.isEmpty()) return;
+        int pos = posMs();
+        double sec = pos / 1000.0;
+        if (roll != null) {
+            roll.setTime(sec);
+            if (rollNow != null && (force || tickCount % 3 == 0)) {
+                String now = roll.soundingAt(sec);
+                if (!now.equals(lastNow)) {
+                    lastNow = now;
+                    rollNow.setText(now.isEmpty() ? "…" : now);
+                }
+            }
+        }
+        if (force || tickCount % 15 == 0) {
+            if (clockLabel != null) clockLabel.setText(fmtTime(pos) + " / " + fmtTime(durMs()));
+            if (seek != null && !seeking) seek.setProgress(pos);
+            for (Stem x : stems) {
+                if (x.playLabel != null) x.playLabel.setText(playText(x));
+            }
+        }
+        updateLyrics(sec, force);
+    }
+
+    /** Tonalité unique du morceau, calculée sur toutes les pistes mélodiques ensemble. */
+    private String songKey() {
+        List<PitchTranscriber.Note> all = new ArrayList<>();
+        for (Stem x : stems) {
+            if (x.notes != null && !isDrums(x)) all.addAll(x.notes);
+        }
+        return PitchTranscriber.detectKey(all);
+    }
+
+    private static boolean isDrums(Stem x) {
+        String n = x.name.toLowerCase(Locale.ROOT);
+        return n.contains("batterie") || n.contains("drum");
+    }
+
+    /** Notes d'une piste, calées sur la tonalité du morceau si l'option est activée. */
+    private List<PitchTranscriber.Note> notesOf(Stem x) {
+        if (x.notes == null) return null;
+        if (prefs.getBoolean("snap_key", false) && !isDrums(x)) {
+            return PitchTranscriber.snapToKey(x.notes, songKey());
+        }
+        return x.notes;
+    }
+
+    /** Carte « Lecteur » : défilé des notes + paroles + commandes, pour les pistes en lecture. */
+    private void buildPlayer(LinearLayout col) {
+        if (mix.isEmpty()) {
+            boolean any = anyNotes();
+            for (Stem x : stems) if (x.lyrics != null) any = true;
+            if (any) {
+                col.addView(Ui.text(this, "Lancez une piste (▶) pour voir les notes et les paroles défiler.",
+                        12, Ui.MUTED, false), Ui.lp(M, W, 0, 0, 0, 12));
+            }
+            return;
+        }
+        LinearLayout card = vbox();
+        card.setBackground(Ui.box(Ui.WHITE, 18, Ui.ORANGE, 2));
+        card.setPadding(Ui.dp(14), Ui.dp(12), Ui.dp(14), Ui.dp(12));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(Ui.text(this, "Lecteur", 16, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
+        String key = songKey();
+        if (!key.equals("indéterminée")) top.addView(pill("Tonalité : " + key, Ui.YELLOW_SOFT, Ui.INK));
+        card.addView(top);
+
+        StringBuilder names = new StringBuilder();
+        for (Stem x : mix.keySet()) {
+            if (names.length() > 0) names.append("  +  ");
+            names.append(x.name);
+        }
+        card.addView(Ui.text(this, "En lecture : " + names, 12, Ui.MUTED, false), Ui.lp(M, W, 0, 3, 0, 8));
+
+        // défilé des notes
+        List<NoteRollView.Track> tracks = new ArrayList<>();
+        for (Stem x : mix.keySet()) {
+            List<PitchTranscriber.Note> n = notesOf(x);
+            if (n != null) tracks.add(new NoteRollView.Track(x.name, STEM_COLORS[stems.indexOf(x) % STEM_COLORS.length], n));
+        }
+        if (!tracks.isEmpty()) {
+            roll = new NoteRollView(this);
+            roll.setTracks(tracks, PitchTranscriber.keyScale(key));
+            card.addView(roll, new LinearLayout.LayoutParams(M, Ui.dp(180)));
+            rollNow = Ui.text(this, "…", 12, Ui.INK, true);
+            card.addView(rollNow, Ui.lp(M, W, 0, 6, 0, 0));
+        } else {
+            card.addView(Ui.text(this, "Extrayez les notes de ces pistes (bouton orange plus bas) pour les voir défiler.",
+                    12, Ui.MUTED, false), Ui.lp(M, W, 0, 0, 0, 4));
+        }
+
+        // paroles
+        if (!lyricLines().isEmpty()) {
+            LinearLayout ly = vbox();
+            ly.setBackground(Ui.box(Ui.YELLOW_SOFT, 14, 0, 0));
+            ly.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10));
+            lyPrev = Ui.text(this, "", 12, Ui.MUTED, false);
+            lyCur = Ui.text(this, "♪", 17, Ui.INK, true);
+            lyNext = Ui.text(this, "", 12, Ui.MUTED, false);
+            lyPrev.setMinLines(1); lyNext.setMinLines(1); lyCur.setMinLines(2);
+            ly.addView(lyPrev);
+            ly.addView(lyCur, Ui.lp(M, W, 0, 3, 0, 3));
+            ly.addView(lyNext);
+            card.addView(ly, Ui.lp(M, W, 0, 10, 0, 0));
+        }
+
+        // commandes
+        LinearLayout ctl = new LinearLayout(this);
+        ctl.setOrientation(LinearLayout.HORIZONTAL);
+        ctl.setGravity(Gravity.CENTER_VERTICAL);
+        playAllBtn = Ui.text(this, mixPaused ? "▶" : "⏸", 16, Ui.WHITE, true);
+        playAllBtn.setGravity(Gravity.CENTER);
+        playAllBtn.setBackground(Ui.box(Ui.ORANGE, 14, 0, 0));
+        playAllBtn.setPadding(Ui.dp(14), Ui.dp(7), Ui.dp(14), Ui.dp(7));
+        playAllBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { togglePauseAll(); }
+        });
+        Ui.pressable(playAllBtn);
+        ctl.addView(playAllBtn);
+        seek = new SeekBar(this);
+        seek.setMax(Math.max(1, durMs()));
+        seek.setProgress(posMs());
+        seek.setProgressTintList(ColorStateList.valueOf(Ui.ORANGE));
+        seek.setThumbTintList(ColorStateList.valueOf(Ui.ORANGE));
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                if (fromUser) { seekAll(progress); updateLive(true); }
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) { seeking = true; }
+            @Override public void onStopTrackingTouch(SeekBar sb) { seeking = false; }
+        });
+        ctl.addView(seek, new LinearLayout.LayoutParams(0, W, 1f));
+        clockLabel = Ui.text(this, "", 11, Ui.MUTED, false);
+        ctl.addView(clockLabel);
+        TextView stop = Ui.text(this, "■", 16, Ui.INK, true);
+        stop.setPadding(Ui.dp(12), Ui.dp(4), Ui.dp(4), Ui.dp(4));
+        stop.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { stopPlayback(); render(false); }
+        });
+        ctl.addView(stop);
+        card.addView(ctl, Ui.lp(M, W, 0, 10, 0, 0));
+
+        col.addView(card, Ui.lp(M, W, 0, 0, 0, 14));
+        updateLive(true);
     }
 
     // ============================================================ navigation
@@ -229,7 +637,9 @@ public class MainActivity extends Activity {
         homeSepBar = null; homeAnaBar = null; progressBar = null;
         homeSepText = null; homeAnaText = null; progressLabel = null; extractLabel = null;
         homeArt1 = null; homeArt2 = null;
-        for (Stem s : stems) { s.bar = null; s.pctLabel = null; }
+        for (Stem s : stems) { s.bar = null; s.pctLabel = null; s.playLabel = null; s.mixLabel = null; }
+        roll = null; rollNow = null; clockLabel = null; lyPrev = null; lyCur = null; lyNext = null;
+        playAllBtn = null; seek = null; lyIdx = -2; lastNow = "";
 
         content.removeAllViews();
         final ScrollView sv = new ScrollView(this);
@@ -624,6 +1034,7 @@ public class MainActivity extends Activity {
     private void buildReview(LinearLayout col) {
         col.addView(header("Pistes", false));
         col.addView(segmented("Pistes", "Notes", segment));
+        buildPlayer(col);
         if (segment == 0) buildStems(col);
         else buildNotes(col);
     }
@@ -786,6 +1197,25 @@ public class MainActivity extends Activity {
         name.setEllipsize(TextUtils.TruncateAt.END);
         card.addView(name);
 
+        TextView play = Ui.text(this, playText(s), 12, Ui.WHITE, true);
+        play.setBackground(Ui.box(Ui.ORANGE, 12, 0, 0));
+        play.setPadding(Ui.dp(10), Ui.dp(6), Ui.dp(10), Ui.dp(6));
+        play.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { togglePlay(s); }
+        });
+        s.playLabel = play;
+        card.addView(play, Ui.lp(W, W, 0, 8, 0, 0));
+
+        boolean inMix = mix.containsKey(s);
+        TextView mixBtn = Ui.text(this, mixText(s), 11, inMix ? Ui.WHITE : Ui.INK, true);
+        mixBtn.setBackground(Ui.box(inMix ? Ui.GREEN_OK : Ui.YELLOW_SOFT, 12, 0, 0));
+        mixBtn.setPadding(Ui.dp(10), Ui.dp(5), Ui.dp(10), Ui.dp(5));
+        mixBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleMix(s); }
+        });
+        s.mixLabel = mixBtn;
+        card.addView(mixBtn, Ui.lp(W, W, 0, 6, 0, 0));
+
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         String state = anaRunning && s.selected && s.notes == null ? "En analyse…"
@@ -834,10 +1264,37 @@ public class MainActivity extends Activity {
     private void buildNotes(LinearLayout col) {
         final List<String> names = new ArrayList<>();
         final List<List<PitchTranscriber.Note>> tracks = new ArrayList<>();
+
+        // Une seule tonalité pour tout le morceau : calculée sur les notes de tous les instruments (sans la batterie)
+        final String songKey = songKey();
+        final boolean snap = prefs.getBoolean("snap_key", false);
+        if (anyNotes()) {
+            LinearLayout kc = vbox();
+            kc.setBackground(Ui.box(Ui.WHITE, 18, Ui.ORANGE, 2));
+            kc.setPadding(Ui.dp(14), Ui.dp(12), Ui.dp(14), Ui.dp(12));
+            kc.addView(Ui.text(this, "Tonalité du morceau (la même pour tous les instruments)", 12, Ui.MUTED, false));
+            kc.addView(Ui.text(this, songKey, 22, Ui.INK, true), Ui.lp(M, W, 0, 2, 0, 0));
+            if (PitchTranscriber.keyScale(songKey) != null) {
+                kc.addView(Ui.text(this, snap
+                        ? "Les notes hors tonalité sont ramenées sur la gamme, dans l'aperçu et dans les fichiers .mid."
+                        : "Les notes hors tonalité sont conservées telles que détectées.", 11, Ui.MUTED, false),
+                        Ui.lp(M, W, 0, 4, 0, 8));
+                kc.addView(pillButtonYellow(snap ? "Caler sur la tonalité : activé" : "Caler sur la tonalité : désactivé",
+                        new View.OnClickListener() {
+                            @Override public void onClick(View v) {
+                                prefs.edit().putBoolean("snap_key", !snap).apply();
+                                render(false);
+                            }
+                        }));
+            }
+            col.addView(kc, Ui.lp(M, W, 0, 0, 0, 12));
+        }
+
         for (final Stem s : stems) {
             if (s.notes == null) continue;
             names.add(s.name);
-            tracks.add(s.notes);
+            final List<PitchTranscriber.Note> shown = notesOf(s);
+            tracks.add(shown);
 
             LinearLayout card = vbox();
             card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
@@ -846,21 +1303,23 @@ public class MainActivity extends Activity {
             top.setOrientation(LinearLayout.HORIZONTAL);
             top.setGravity(Gravity.CENTER_VERTICAL);
             top.addView(Ui.text(this, s.name, 17, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
-            top.addView(pill(s.notes.size() + " notes", Ui.YELLOW_SOFT, Ui.INK));
+            top.addView(pill(shown.size() + " notes", Ui.YELLOW_SOFT, Ui.INK));
             card.addView(top);
-            card.addView(Ui.text(this, "Tonalité : " + PitchTranscriber.detectKey(s.notes), 15, Ui.INK, true),
-                    Ui.lp(M, W, 0, 6, 0, 0));
+            if (!isDrums(s)) {
+                card.addView(Ui.text(this, "Tonalité du morceau : " + songKey, 15, Ui.INK, true),
+                        Ui.lp(M, W, 0, 6, 0, 0));
+            }
             if (!s.engine.isEmpty()) {
                 card.addView(Ui.text(this, "Moteur : " + s.engine, 11, Ui.MUTED, false), Ui.lp(M, W, 0, 2, 0, 0));
             }
-            TextView list = Ui.text(this, describe(s.notes), 12, Ui.INK, false);
+            TextView list = Ui.text(this, describe(shown), 12, Ui.INK, false);
             list.setTypeface(Typeface.MONOSPACE);
             list.setTextIsSelectable(true);
             card.addView(list, Ui.lp(M, W, 0, 10, 0, 10));
             card.addView(pillButtonYellow("Enregistrer " + s.name + " en .mid", new View.OnClickListener() {
                 @Override public void onClick(View v) {
                     List<List<PitchTranscriber.Note>> t1 = new ArrayList<>();
-                    t1.add(s.notes);
+                    t1.add(shown);
                     saveMidi(MidiWriter.write(Collections.singletonList(s.name), t1), s.name);
                 }
             }));
@@ -1381,6 +1840,7 @@ public class MainActivity extends Activity {
                     sepRunning = false;
                     ui.post(new Runnable() {
                         @Override public void run() {
+                            stopPlayback();
                             stems.clear();
                             stems.addAll(result);
                             savedOnce = false;
