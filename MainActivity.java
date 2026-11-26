@@ -56,6 +56,9 @@ public class MainActivity extends Activity {
         boolean selected = true;
         boolean poly;
         List<PitchTranscriber.Note> notes;
+        volatile String lyrics;
+        volatile String engine = "";
+        volatile boolean lyricsBusy;
         volatile float pct;
         BarView bar;
         TextView pctLabel;
@@ -146,6 +149,14 @@ public class MainActivity extends Activity {
                     });
                 } catch (Exception ignored) {
                     // hors ligne : on garde la clé déjà enregistrée
+                }
+                try {
+                    final String g = SupabaseConfig.fetchGroqToken();
+                    if (!g.isEmpty() && !g.equals(prefs.getString("groq_token", ""))) {
+                        prefs.edit().putString("groq_token", g).apply();
+                    }
+                } catch (Exception ignored) {
+                    // pas de clé Groq en ligne : on utilise celle du Profil
                 }
             }
         });
@@ -719,6 +730,50 @@ public class MainActivity extends Activity {
             extractLabel = b;
             col.addView(b, Ui.lp(M, W, 0, 6, 0, 0));
         }
+
+        for (final Stem s : stems) {
+            if (s.lyrics == null) continue;
+            LinearLayout lc = vbox();
+            lc.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+            lc.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
+            lc.addView(Ui.text(this, "Paroles · " + s.name, 16, Ui.INK, true));
+            TextView t = Ui.text(this, s.lyrics, 13, Ui.INK, false);
+            t.setTextIsSelectable(true);
+            lc.addView(t, Ui.lp(M, W, 0, 8, 0, 6));
+            lc.addView(Ui.text(this, "Écrit par Whisper (Groq) : peut contenir des erreurs.", 11, Ui.MUTED, false));
+            col.addView(lc, Ui.lp(M, W, 0, 14, 0, 0));
+        }
+    }
+
+    // ============================================================ paroles (Groq / Whisper)
+    private void startLyrics(final Stem s) {
+        final String token = prefs.getString("groq_token", "").trim();
+        final String lang = prefs.getString("groq_lang", "").trim().toLowerCase(Locale.ROOT);
+        if (token.isEmpty()) {
+            toast("Ajoutez d'abord votre clé API Groq (Profil)");
+            select(3);
+            return;
+        }
+        if (s.lyricsBusy) return;
+        s.lyricsBusy = true;
+        render(false);
+        toast("Écriture des paroles en cours…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    String txt = GroqClient.transcribe(token, s.file, lang);
+                    s.lyrics = txt.isEmpty() ? "Aucune parole détectée." : txt;
+                    toastLater("Paroles prêtes : voir en bas de l'onglet Pistes");
+                } catch (Exception e) {
+                    toastLater("Erreur Groq : " + e.getMessage());
+                } finally {
+                    s.lyricsBusy = false;
+                    ui.post(new Runnable() {
+                        @Override public void run() { render(false); }
+                    });
+                }
+            }
+        }).start();
     }
 
     private View stemCard(final Stem s) {
@@ -756,6 +811,15 @@ public class MainActivity extends Activity {
         });
         card.addView(mode, Ui.lp(W, W, 0, 0, 0, 0));
 
+        TextView ly = Ui.text(this, s.lyricsBusy ? "Paroles…" : (s.lyrics != null ? "Paroles ✓" : "Paroles (Groq)"),
+                11, Ui.INK, true);
+        ly.setBackground(Ui.box(Ui.YELLOW_SOFT, 10, 0, 0));
+        ly.setPadding(Ui.dp(9), Ui.dp(4), Ui.dp(9), Ui.dp(4));
+        ly.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { startLyrics(s); }
+        });
+        card.addView(ly, Ui.lp(W, W, 0, 6, 0, 0));
+
         card.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (anaRunning) return;
@@ -784,6 +848,11 @@ public class MainActivity extends Activity {
             top.addView(Ui.text(this, s.name, 17, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
             top.addView(pill(s.notes.size() + " notes", Ui.YELLOW_SOFT, Ui.INK));
             card.addView(top);
+            card.addView(Ui.text(this, "Tonalité : " + PitchTranscriber.detectKey(s.notes), 15, Ui.INK, true),
+                    Ui.lp(M, W, 0, 6, 0, 0));
+            if (!s.engine.isEmpty()) {
+                card.addView(Ui.text(this, "Moteur : " + s.engine, 11, Ui.MUTED, false), Ui.lp(M, W, 0, 2, 0, 0));
+            }
             TextView list = Ui.text(this, describe(s.notes), 12, Ui.INK, false);
             list.setTypeface(Typeface.MONOSPACE);
             list.setTextIsSelectable(true);
@@ -845,7 +914,7 @@ public class MainActivity extends Activity {
             PitchTranscriber.Note n = notes.get(i);
             int min = (int) (n.start / 60);
             double sec = n.start - min * 60;
-            sb.append(String.format(Locale.US, "%d:%05.2f  %-4s %.2f s\n",
+            sb.append(String.format(Locale.US, "%d:%05.2f  %-6s %.2f s\n",
                     min, sec, PitchTranscriber.noteName(n.pitch), n.end - n.start));
         }
         if (notes.size() > max) sb.append("… +").append(notes.size() - max).append(" dans le .mid");
@@ -934,9 +1003,17 @@ public class MainActivity extends Activity {
         card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
         card.addView(Ui.text(this, "Réglages MVSEP", 16, Ui.INK, true));
         card.addView(field("Clé API (mvsep.com/user-api)", "token", "", false));
-        card.addView(field("Type de séparation (sep_type)", "sep_type", "20", true));
+        card.addView(field("Type de séparation (sep_type, 63 = chant/basse/batterie/guitare/piano)", "sep_type", "63", true));
         card.addView(field("Option du modèle (add_opt1, facultatif)", "opt1", "", false));
         col.addView(card);
+
+        LinearLayout g = vbox();
+        g.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
+        g.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
+        g.addView(Ui.text(this, "Réglages Groq (paroles)", 16, Ui.INK, true));
+        g.addView(field("Clé API Groq (console.groq.com/keys)", "groq_token", "", false));
+        g.addView(field("Langue des paroles (fr, en… vide = automatique)", "groq_lang", "", false));
+        col.addView(g, Ui.lp(M, W, 0, 12, 0, 0));
     }
 
     private View statCard(String label, int value) {
@@ -1111,6 +1188,19 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    private static void copyFile(File from, File to) throws java.io.IOException {
+        InputStream in = new java.io.FileInputStream(from);
+        FileOutputStream os = new FileOutputStream(to);
+        try {
+            byte[] b = new byte[65536];
+            int r;
+            while ((r = in.read(b)) > 0) os.write(b, 0, r);
+        } finally {
+            os.close();
+            in.close();
+        }
+    }
+
     private void saveMidi(byte[] data, String name) {
         pendingMidi = data;
         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
@@ -1140,11 +1230,77 @@ public class MainActivity extends Activity {
         return "input." + ext;
     }
 
+    /** Une séparation MVSEP complète avec un modèle donné : envoi, attente, téléchargement des pistes. */
+    private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1)
+            throws Exception {
+        String hash;
+        try {
+            hash = MvsepClient.create(token, upload, sepType, opt1, upName);
+        } catch (java.io.IOException first) {
+            sepStatus = "Nouvel essai MVSEP"; postLive();
+            Thread.sleep(4000);
+            hash = MvsepClient.create(token, upload, sepType, opt1, upName);
+        }
+        sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive();
+
+        final int[] polls = {0};
+        List<MvsepClient.Remote> files = MvsepClient.waitForResult(hash,
+                new MvsepClient.Status() {
+                    @Override public void onStatus(String st) {
+                        polls[0]++;
+                        sepPct = 20f + 65f * (1f - (float) Math.exp(-polls[0] / 60.0));
+                        sepStatus = st;
+                        postLive();
+                    }
+                });
+
+        List<Stem> out = new ArrayList<>();
+        for (int i = 0; i < files.size(); i++) {
+            MvsepClient.Remote r = files.get(i);
+            sepPct = 85f + 15f * i / files.size();
+            sepStatus = "Téléchargement : " + frName(r.name);
+            postLive();
+            File f = new File(getCacheDir(), "stem_" + i);
+            MvsepClient.download(r.url, f);
+            Stem s = new Stem(frName(r.name), f);
+            s.poly = guessPoly(r.name);
+            String low = r.name.toLowerCase(Locale.ROOT);
+            s.selected = !(low.contains("drum") || low.contains("batterie"));
+            out.add(s);
+        }
+        return out;
+    }
+
+    /** Nom d'instrument en français à partir du nom renvoyé par MVSEP. */
+    private static String frName(String raw) {
+        String l = raw == null ? "" : raw.toLowerCase(Locale.ROOT);
+        if (l.contains("lead-guitar") || l.contains("lead guitar")) return "Guitare solo";
+        if (l.contains("rhythm")) return "Guitare rythmique";
+        if (l.contains("acoustic")) return "Guitare acoustique";
+        if (l.contains("electric-guitar") || l.contains("electric guitar")) return "Guitare électrique";
+        if (l.contains("guitar")) return "Guitare";
+        if (l.contains("digital-piano")) return "Piano numérique";
+        if (l.contains("piano")) return "Piano";
+        if (l.contains("bass")) return "Basse";
+        if (l.contains("drum")) return "Batterie";
+        if (l.contains("lead") && l.contains("vocal")) return "Chant principal";
+        if (l.contains("back") && l.contains("vocal")) return "Chœurs";
+        if (l.contains("vocal")) return "Chant";
+        if (l.contains("instrum")) return "Instrumental";
+        if (l.contains("string")) return "Cordes";
+        if (l.contains("wind")) return "Vents";
+        if (l.contains("synth")) return "Synthé";
+        if (l.contains("organ")) return "Orgue";
+        if (l.contains("keys")) return "Claviers";
+        if (l.contains("other")) return "Autres instruments";
+        return raw == null || raw.isEmpty() ? "Piste" : raw.substring(0, 1).toUpperCase(Locale.ROOT) + raw.substring(1);
+    }
+
     private void startSeparation() {
         if (busy) { toast("Une tâche est en cours"); return; }
         final String token = prefs.getString("token", "").trim();
-        String st = prefs.getString("sep_type", "20").trim();
-        final String sepType = st.isEmpty() ? "20" : st;
+        String st = prefs.getString("sep_type", "63").trim();
+        final String sepType = st.isEmpty() ? "63" : st;
         final String opt1 = prefs.getString("opt1", "").trim();
         if (token.isEmpty()) { toast("Ajoutez d'abord votre clé API (Profil)"); select(3); return; }
         if (songUri == null) { toast("Choisissez d'abord un morceau"); return; }
@@ -1157,50 +1313,80 @@ public class MainActivity extends Activity {
         sepStatus = "Préparation du fichier";
         render(false);
 
+        final String[] planB = {null};
         exec.execute(new Runnable() {
             @Override public void run() {
                 try {
                     File in = copyToCache(song, "input_song");
-                    sepPct = 8f; sepStatus = "Envoi à MVSEP"; postLive();
-                    String hash = MvsepClient.create(token, in, sepType, opt1, uploadName);
-                    sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive();
 
-                    final int[] polls = {0};
-                    List<MvsepClient.Remote> files = MvsepClient.waitForResult(hash,
-                            new MvsepClient.Status() {
-                                @Override public void onStatus(String s) {
-                                    polls[0]++;
-                                    sepPct = 20f + 65f * (1f - (float) Math.exp(-polls[0] / 24.0));
-                                    sepStatus = s + " (estimation)";
-                                    postLive();
-                                }
-                            });
-
-                    final List<Stem> fresh = new ArrayList<>();
-                    for (int i = 0; i < files.size(); i++) {
-                        MvsepClient.Remote r = files.get(i);
-                        sepPct = 85f + 15f * i / files.size();
-                        sepStatus = "Téléchargement : " + r.name;
-                        postLive();
-                        File out = new File(getCacheDir(), "stem_" + i);
-                        MvsepClient.download(r.url, out);
-                        Stem s = new Stem(r.name, out);
-                        s.poly = guessPoly(r.name);
-                        String low = r.name.toLowerCase(Locale.ROOT);
-                        s.selected = !(low.contains("drum") || low.contains("batterie"));
-                        fresh.add(s);
+                    // MVSEP refuse tout ce qui n'est pas un vrai fichier audio : on vérifie le format réel
+                    File upload = in;
+                    String upName;
+                    String ext = AudioDecoder.sniffExt(in);
+                    if (ext == null || ext.equals("aac")) {
+                        sepPct = 4f; sepStatus = "Conversion du fichier en WAV"; postLive();
+                        upload = new File(getCacheDir(), "input_song.wav");
+                        try {
+                            AudioDecoder.toWav(in, upload);
+                        } catch (Exception conv) {
+                            throw new Exception("Ce fichier n'est pas un audio lisible (" + conv.getMessage() + ")");
+                        }
+                        upName = "input.wav";
+                    } else {
+                        upName = "input." + ext;
                     }
+
+                    // Modèles essayés dans l'ordre : le suivant prend le relais si le précédent échoue
+                    List<String[]> attempts = new ArrayList<>();
+                    attempts.add(new String[]{sepType, opt1});
+                    attempts.add(new String[]{"63", ""});
+                    attempts.add(new String[]{"20", "2"});
+                    attempts.add(new String[]{"20", ""});
+                    List<String[]> uniq = new ArrayList<>();
+                    for (String[] a : attempts) {
+                        boolean dup = false;
+                        for (String[] u : uniq) if (u[0].equals(a[0]) && u[1].equals(a[1])) dup = true;
+                        if (!dup) uniq.add(a);
+                    }
+
+                    List<Stem> fresh = null;
+                    String lastErr = "";
+                    for (int a = 0; a < uniq.size() && fresh == null; a++) {
+                        try {
+                            sepPct = 8f;
+                            sepStatus = a == 0 ? "Envoi à MVSEP" : "Autre modèle MVSEP (" + a + "/" + (uniq.size() - 1) + ")";
+                            postLive();
+                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1]);
+                        } catch (Throwable mvsepFail) {
+                            lastErr = String.valueOf(mvsepFail.getMessage());
+                            if (lastErr.contains("not an Audio")) break; // un autre modèle n'y changera rien
+                        }
+                    }
+                    if (fresh == null) {
+                        // Plan B : MVSEP indisponible -> on analyse le morceau complet sur le téléphone
+                        sepStatus = "Plan B : analyse du morceau complet"; postLive();
+                        File full = new File(getCacheDir(), "stem_full");
+                        copyFile(in, full);
+                        fresh = new ArrayList<>();
+                        Stem whole = new Stem("Morceau complet", full);
+                        whole.poly = true;
+                        fresh.add(whole);
+                        String why = lastErr;
+                        if (why.length() > 110) why = why.substring(0, 110) + "…";
+                        planB[0] = "MVSEP indisponible (" + why + ") : le morceau complet est analysé à la place";
+                    }
+                    final List<Stem> result = fresh;
                     sepPct = 100f;
                     sepStatus = "Terminé";
                     sepRunning = false;
                     ui.post(new Runnable() {
                         @Override public void run() {
                             stems.clear();
-                            stems.addAll(fresh);
+                            stems.addAll(result);
                             savedOnce = false;
                             prefs.edit().putInt("sep_count", prefs.getInt("sep_count", 0) + 1).apply();
                             render(false);
-                            toast("Séparation terminée");
+                            toast(planB[0] != null ? planB[0] : "Séparation terminée");
                         }
                     });
                 } catch (Throwable e) {
@@ -1254,9 +1440,20 @@ public class MainActivity extends Activity {
                                 postLive();
                             }
                         };
-                        List<PitchTranscriber.Note> res = s.poly
-                                ? PitchTranscriber.transcribePoly(pcm, PitchTranscriber.SAMPLE_RATE, p)
-                                : PitchTranscriber.transcribeMono(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                        List<PitchTranscriber.Note> res = null;
+                        try {
+                            res = BasicPitchTranscriber.transcribe(getApplicationContext(), pcm, s.poly, p);
+                            s.engine = "Basic Pitch (IA)";
+                        } catch (Throwable bpFail) {
+                            res = null; // la détection intégrée prend le relais
+                        }
+                        if (res == null) {
+                            s.pct = 0f;
+                            res = s.poly
+                                    ? PitchTranscriber.transcribePoly(pcm, PitchTranscriber.SAMPLE_RATE, p)
+                                    : PitchTranscriber.transcribeMono(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                            s.engine = "détection intégrée";
+                        }
                         s.notes = res;
                         s.pct = 1f;
                         total += res.size();

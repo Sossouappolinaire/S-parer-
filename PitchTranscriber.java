@@ -367,10 +367,61 @@ final class PitchTranscriber {
     }
 
     // ---------------------------------------------------------------- Utilitaires
+    // Noms des notes en solfège français
     private static final String[] NAMES =
-            {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            {"Do", "Do#", "Ré", "Ré#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"};
 
+    private static final double[] KEY_MAJOR =
+            {6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88};
+    private static final double[] KEY_MINOR =
+            {6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17};
+
+    /** Nom d'une note en solfège avec son octave, par ex. « Ré4 » ou « Fa#3 ». */
     static String noteName(int pitch) {
         return NAMES[pitch % 12] + (pitch / 12 - 1);
+    }
+
+    /** Tonalité estimée (algorithme de Krumhansl-Schmuckler), par ex. « Fa majeur » ou « Mi mineur ». */
+    static String detectKey(List<Note> notes) {
+        if (notes == null || notes.size() < 4) return "indéterminée";
+        double[] h = new double[12];
+        for (Note n : notes) {
+            h[((n.pitch % 12) + 12) % 12] += Math.max(0.05, n.end - n.start);
+        }
+        double best = -2;
+        int bestTonic = 0;
+        boolean bestMajor = true;
+        for (int t = 0; t < 12; t++) {
+            for (int m = 0; m < 2; m++) {
+                double[] prof = m == 0 ? KEY_MAJOR : KEY_MINOR;
+                double r = correlation(h, prof, t);
+                if (r > best) {
+                    best = r;
+                    bestTonic = t;
+                    bestMajor = m == 0;
+                }
+            }
+        }
+        return NAMES[bestTonic] + (bestMajor ? " majeur" : " mineur");
+    }
+
+    private static double correlation(double[] h, double[] prof, int tonic) {
+        double mh = 0, mp = 0;
+        for (int i = 0; i < 12; i++) {
+            mh += h[i];
+            mp += prof[i];
+        }
+        mh /= 12;
+        mp /= 12;
+        double num = 0, dh = 0, dp = 0;
+        for (int i = 0; i < 12; i++) {
+            double a = h[(i + tonic) % 12] - mh;
+            double b = prof[i] - mp;
+            num += a * b;
+            dh += a * a;
+            dp += b * b;
+        }
+        if (dh == 0 || dp == 0) return -2;
+        return num / Math.sqrt(dh * dp);
     }
 }

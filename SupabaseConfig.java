@@ -18,7 +18,16 @@ final class SupabaseConfig {
 
     /** Renvoie la clé MVSEP, ou une chaîne vide si elle est introuvable. */
     static String fetchMvsepToken() throws IOException {
-        String u = URL_BASE + "/rest/v1/stemnotes_config?select=value&key=eq.mvsep_api_token";
+        return fetchValue("mvsep_api_token");
+    }
+
+    /** Renvoie la clé Groq, ou une chaîne vide si elle est introuvable. */
+    static String fetchGroqToken() throws IOException {
+        return fetchValue("groq_api_key");
+    }
+
+    private static String fetchValue(String key) throws IOException {
+        String u = URL_BASE + "/rest/v1/stemnotes_config?select=value&key=eq." + key;
         HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
         c.setConnectTimeout(15000);
         c.setReadTimeout(15000);

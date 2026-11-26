@@ -36,6 +36,11 @@ android {
     }
 }
 
+dependencies {
+    // Basic Pitch (transcription des notes sur le téléphone)
+    implementation 'org.tensorflow:tensorflow-lite:2.16.1'
+}
+
 def copyJavaSources = tasks.register('copyJavaSources', Copy) {
     from(projectDir) {
         include '*.java'

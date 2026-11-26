@@ -91,7 +91,8 @@ final class MvsepClient {
     /** Attend la fin de la séparation puis renvoie les pistes à télécharger. */
     static List<Remote> waitForResult(String hash, Status cb) throws Exception {
         String url = BASE + "get?hash=" + URLEncoder.encode(hash, "UTF-8");
-        for (int i = 0; i < 360; i++) { // ~30 minutes max
+        final long t0 = System.currentTimeMillis();
+        for (int i = 0; i < 540; i++) { // ~90 minutes max (file d'attente MVSEP parfois longue)
             HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
             c.setConnectTimeout(30000);
             c.setReadTimeout(60000);
@@ -121,10 +122,25 @@ final class MvsepClient {
             if ("failed".equals(st) || "error".equals(st) || "not_found".equals(st)) {
                 throw new IOException("MVSEP a échoué (" + st + ") : " + body);
             }
-            if (cb != null) cb.onStatus(st.isEmpty() ? "en attente" : st);
-            Thread.sleep(5000);
+            if (cb != null) {
+                StringBuilder sb = new StringBuilder();
+                if ("waiting".equals(st) || st.isEmpty()) sb.append("file d'attente MVSEP");
+                else if ("processing".equals(st)) sb.append("traitement en cours");
+                else sb.append(st);
+                JSONObject d = j.optJSONObject("data");
+                if (d != null) {
+                    int order = d.optInt("current_order", -1);
+                    int count = d.optInt("queue_count", -1);
+                    if (order > 0 && count > 0) sb.append(" · position ").append(order).append("/").append(count);
+                    else if (order > 0) sb.append(" · position ").append(order);
+                }
+                long min = (System.currentTimeMillis() - t0) / 60000L;
+                sb.append(" · ").append(min).append(" min");
+                cb.onStatus(sb.toString());
+            }
+            Thread.sleep(10000);
         }
-        throw new IOException("MVSEP : délai dépassé (30 min)");
+        throw new IOException("MVSEP : délai dépassé (90 min). Réessayez plus tard.");
     }
 
     static void download(String url, File dest) throws IOException {
