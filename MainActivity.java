@@ -1760,7 +1760,7 @@ public class MainActivity extends Activity {
         card.addView(field("Clé API (mvsep.com/user-api)", "token", "", false));
         card.addView(field("Type de séparation (sep_type) : 63 = chant/basse/batterie/guitare/piano · 30 = Ensemble All-In, plus lent mais sépare mieux le piano des autres instruments", "sep_type", "63", true));
         card.addView(field("Option du modèle (add_opt1, facultatif)", "opt1", "", false));
-        card.addView(field("Affinage par modèles dédiés (2 = basse, batterie, piano, guitare · 1 = basse seulement · 0 = aucun). Séparation plus propre, mais plus longue", "refine", "2", true));
+        card.addView(field("Affinage par modèles dédiés (1 = basse seulement, rapide · 2 = basse, batterie, piano, guitare · 0 = aucun). Lancés en même temps que la séparation", "refine", "1", true));
         col.addView(card);
 
         LinearLayout g = vbox();
@@ -1996,58 +1996,88 @@ public class MainActivity extends Activity {
             {"Piano", "29", "5"},      // MVSep Piano (BS Roformer SW)
             {"Guitare", "31", "7"}};   // MVSep Guitar (BS Roformer SW)
 
+    private static final class RefineJob {
+        final String name;
+        final java.util.concurrent.Future<Stem> result;
+
+        RefineJob(String name, java.util.concurrent.Future<Stem> result) {
+            this.name = name;
+            this.result = result;
+        }
+    }
+
     /**
-     * Remplace chaque piste du modèle multi-pistes par celle d'un modèle dédié à cet instrument (bien moins de
-     * mélange entre instruments). Si un modèle dédié échoue, on garde la piste d'origine.
-     * Réglage « refine » : 0 = aucun, 1 = basse seulement, 2 = basse + batterie + piano + guitare.
+     * Lance EN PARALLÈLE de la séparation principale les modèles dédiés (basse, batterie, piano, guitare) :
+     * les attentes se chevauchent au lieu de s'additionner, donc presque pas de temps en plus.
+     * Réglage « refine » : 0 = aucun, 1 = basse seulement (défaut), 2 = basse + batterie + piano + guitare.
      */
-    private List<Stem> refineStems(String token, File upload, String upName, List<Stem> base) {
-        String mode = prefs.getString("refine", "2").trim();
-        if (mode.equals("0")) return base;
-        int max = mode.equals("1") ? 1 : REFINE.length;
-        List<Stem> out = new ArrayList<>(base);
+    private List<RefineJob> launchRefine(final String token, final File upload, final String upName) {
+        List<RefineJob> jobs = new ArrayList<>();
+        String mode = prefs.getString("refine", "1").trim();
+        if (mode.equals("0")) return jobs;
+        int max = mode.equals("2") ? REFINE.length : 1;
+        ExecutorService pool = Executors.newFixedThreadPool(max);
         for (int r = 0; r < max; r++) {
-            String[] m = REFINE[r];
+            final int rr = r;
+            final String[] m = REFINE[r];
+            jobs.add(new RefineJob(m[0], pool.submit(new java.util.concurrent.Callable<Stem>() {
+                @Override public Stem call() throws Exception {
+                    List<Stem> ded = mvsepOnce(token, upload, upName, m[1], m[2], "ref" + rr + "_", false);
+                    for (Stem d : ded) if (d.name.equals(m[0])) return d;
+                    return null;
+                }
+            })));
+        }
+        pool.shutdown();
+        return jobs;
+    }
+
+    /**
+     * Remplace chaque piste du modèle multi-pistes par celle du modèle dédié (bien moins de mélange entre
+     * instruments). Si un modèle dédié échoue ou tarde trop, on garde la piste d'origine.
+     */
+    private List<Stem> applyRefine(List<RefineJob> jobs, List<Stem> base) {
+        List<Stem> out = new ArrayList<>(base);
+        for (RefineJob j : jobs) {
             int at = -1;
-            for (int i = 0; i < out.size(); i++) if (out.get(i).name.equals(m[0])) at = i;
-            if (at < 0) continue;
+            for (int i = 0; i < out.size(); i++) if (out.get(i).name.equals(j.name)) at = i;
+            if (at < 0) { j.result.cancel(true); continue; }
             try {
-                sepPct = 8f;
-                sepStatus = "Affinage : " + m[0] + " (modèle dédié)";
+                sepPct = Math.max(sepPct, 90f);
+                sepStatus = "Affinage " + j.name + " : fin du modèle dédié";
                 postLive();
-                List<Stem> ded = mvsepOnce(token, upload, upName, m[1], m[2], "ref" + r + "_");
-                for (Stem d : ded) {
-                    if (d.name.equals(m[0])) {
-                        d.poly = out.get(at).poly;
-                        d.selected = out.get(at).selected;
-                        out.set(at, d);
-                        break;
-                    }
+                Stem d = j.result.get(12, java.util.concurrent.TimeUnit.MINUTES);
+                if (d != null) {
+                    d.poly = out.get(at).poly;
+                    d.selected = out.get(at).selected;
+                    out.set(at, d);
                 }
             } catch (Throwable ignore) {
-                // on garde la piste du modèle multi-pistes
+                j.result.cancel(true); // on garde la piste du modèle multi-pistes
             }
         }
         return out;
     }
 
     /** Une séparation MVSEP complète avec un modèle donné : envoi, attente, téléchargement des pistes. */
-    private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1, String prefix)
-            throws Exception {
+    private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1, String prefix,
+                                 boolean report) throws Exception {
         String hash;
         try {
             hash = MvsepClient.create(token, upload, sepType, opt1, upName);
         } catch (java.io.IOException first) {
-            sepStatus = "Nouvel essai MVSEP"; postLive();
+            if (report) { sepStatus = "Nouvel essai MVSEP"; postLive(); }
             Thread.sleep(4000);
             hash = MvsepClient.create(token, upload, sepType, opt1, upName);
         }
-        sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive();
+        if (report) { sepPct = 20f; sepStatus = "En file d'attente chez MVSEP"; postLive(); }
 
         final int[] polls = {0};
+        final boolean rep = report;
         List<MvsepClient.Remote> files = MvsepClient.waitForResult(hash,
                 new MvsepClient.Status() {
                     @Override public void onStatus(String st) {
+                        if (!rep) return;
                         polls[0]++;
                         sepPct = 20f + 65f * (1f - (float) Math.exp(-polls[0] / 60.0));
                         sepStatus = st;
@@ -2058,9 +2088,11 @@ public class MainActivity extends Activity {
         List<Stem> out = new ArrayList<>();
         for (int i = 0; i < files.size(); i++) {
             MvsepClient.Remote r = files.get(i);
-            sepPct = 85f + 15f * i / files.size();
-            sepStatus = "Téléchargement : " + frName(r.name);
-            postLive();
+            if (report) {
+                sepPct = 85f + 5f * i / files.size();
+                sepStatus = "Téléchargement : " + frName(r.name);
+                postLive();
+            }
             File f = new File(getCacheDir(), prefix + i);
             MvsepClient.download(r.url, f);
             Stem s = new Stem(frName(r.name), f);
@@ -2161,6 +2193,8 @@ public class MainActivity extends Activity {
                         if (!dup) uniq.add(a);
                     }
 
+                    // modèles dédiés lancés en parallèle (basse…) pendant la séparation principale
+                    List<RefineJob> refJobs = launchRefine(token, upload, upName);
                     List<Stem> fresh = null;
                     String lastErr = "";
                     for (int a = 0; a < uniq.size() && fresh == null; a++) {
@@ -2168,7 +2202,7 @@ public class MainActivity extends Activity {
                             sepPct = 8f;
                             sepStatus = a == 0 ? "Envoi à MVSEP" : "Autre modèle MVSEP (" + a + "/" + (uniq.size() - 1) + ")";
                             postLive();
-                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1], "stem_");
+                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1], "stem_", true);
                         } catch (Throwable mvsepFail) {
                             lastErr = String.valueOf(mvsepFail.getMessage());
                             if (lastErr.contains("not an Audio")) break; // un autre modèle n'y changera rien
@@ -2176,12 +2210,13 @@ public class MainActivity extends Activity {
                     }
                     if (fresh == null) {
                         // Plus de « plan B » : analyser le morceau complet mélangerait tous les instruments.
+                        for (RefineJob j : refJobs) j.result.cancel(true);
                         String why = lastErr;
                         if (why.length() > 160) why = why.substring(0, 160) + "…";
                         throw new Exception("Séparation impossible (" + why + "). Vérifiez la clé API et la connexion, puis réessayez.");
                     }
                     // Modèles dédiés (basse, batterie, piano, guitare) : pistes plus propres, sans mélange
-                    fresh = refineStems(token, upload, upName, fresh);
+                    fresh = applyRefine(refJobs, fresh);
                     sepPct = 100f;
                     sepStatus = "Terminé";
                     sepRunning = false;
