@@ -24,6 +24,8 @@ final class MidiWriter {
         for (int i = 0; i < tracks.size(); i++) {
             int channel = i % 15;
             if (channel >= 9) channel++; // évite le canal 10 (percussions)
+            String lower = names.get(i).toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("batterie") || lower.contains("drum") || lower.contains("touba")) channel = 9; // batterie et Touba : canal 10
             byte[] trk = buildTrack(names.get(i), tracks.get(i), i == 0, channel);
             writeAscii(out, "MTrk");
             writeInt(out, trk.length);

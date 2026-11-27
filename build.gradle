@@ -10,8 +10,8 @@ android {
         applicationId 'com.stemnotes.app2' // nouvel identifiant : s'installe à côté de l'ancienne version, sans conflit de signature
         minSdk 24
         targetSdk 34
-        versionCode 4
-        versionName '1.3'
+        versionCode 6
+        versionName '1.5'
     }
 
     // Clé de signature fixe : chaque build GitHub est signé pareil, donc l'APK
@@ -33,6 +33,8 @@ android {
         main {
             manifest.srcFile 'AndroidManifest.xml'
             java.setSrcDirs([layout.buildDirectory.dir('generated/flatjava').get().asFile])
+            // Icône de l'application : les fichiers ic_launcher* sont aussi à la racine, rangés ici au moment du build
+            res.setSrcDirs([layout.buildDirectory.dir('generated/flatres').get().asFile])
         }
     }
 
@@ -62,4 +64,19 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.matching { it.name == 'preBuild' }.configureEach {
     dependsOn copyJavaSources
+}
+
+def copyResources = tasks.register('copyResources', Copy) {
+    into layout.buildDirectory.dir('generated/flatres')
+    from(projectDir) { include 'ic_launcher.png'; into 'mipmap-nodpi' }
+    from(projectDir) { include 'ic_launcher_adaptive.xml'; rename { 'ic_launcher.xml' }; into 'mipmap-anydpi-v26' }
+    from(projectDir) { include 'ic_launcher_foreground.png'; into 'drawable-nodpi' }
+    from(projectDir) { include 'ic_launcher_background.xml'; into 'drawable' }
+}
+
+tasks.matching {
+    it.name == 'preBuild' || it.name.startsWith('merge') || it.name.startsWith('map')
+            || it.name.startsWith('generate') || it.name.startsWith('process')
+}.configureEach {
+    dependsOn copyResources
 }

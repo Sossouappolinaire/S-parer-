@@ -41,10 +41,12 @@ final class StemStore {
     static final class Song {
         final String title;
         final int count;
+        final boolean analyzed; // les notes de ce morceau sont aussi enregistrées (ouverture hors ligne complète)
 
-        Song(String title, int count) {
+        Song(String title, int count, boolean analyzed) {
             this.title = title;
             this.count = count;
+            this.analyzed = analyzed;
         }
     }
 
@@ -232,7 +234,7 @@ final class StemStore {
                 }
             }
             for (java.util.Map.Entry<String, java.util.Set<String>> e : map.entrySet()) {
-                out.add(new Song(e.getKey(), e.getValue().size()));
+                out.add(new Song(e.getKey(), e.getValue().size(), NoteStore.has(ctx, e.getKey())));
             }
         } catch (Exception ignored) {
         }

@@ -237,7 +237,8 @@ public class MainActivity extends Activity {
                 final List<StemStore.Song> now = StemStore.listSongs(getApplicationContext());
                 boolean same = now.size() == savedSongs.size();
                 for (int i = 0; same && i < now.size(); i++) {
-                    same = now.get(i).title.equals(savedSongs.get(i).title) && now.get(i).count == savedSongs.get(i).count;
+                    same = now.get(i).title.equals(savedSongs.get(i).title) && now.get(i).count == savedSongs.get(i).count
+                            && now.get(i).analyzed == savedSongs.get(i).analyzed;
                 }
                 if (same) return;
                 ui.post(new Runnable() {
@@ -350,7 +351,14 @@ public class MainActivity extends Activity {
             Stem st = new Stem(e.instrument, f);
             st.poly = guessPoly(e.instrument);
             String low = e.instrument.toLowerCase(Locale.ROOT);
-            st.selected = !(low.contains("drum") || low.contains("batterie"));
+            st.selected = defaultSelected(low);
+            NoteStore.Loaded ld = NoteStore.load(getApplicationContext(), title, e.instrument);
+            if (ld != null) { // analyse déjà faite : notes et paroles relues sans internet
+                st.notes = ld.notes;
+                st.engine = ld.engine;
+                st.lyrics = ld.lyrics;
+                if (ld.notes != null) st.pct = 1f;
+            }
             found.add(st);
             sepPct = 10f + 90f * (i + 1) / saved.size();
             postLive();
@@ -363,8 +371,8 @@ public class MainActivity extends Activity {
         LinearLayout card = vbox();
         card.setBackground(Ui.box(Ui.WHITE, 18, Ui.YELLOW_BORDER, 1.5f));
         card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(8));
-        card.addView(Ui.text(this, "Morceaux déjà séparés", 16, Ui.INK, true));
-        card.addView(Ui.text(this, "Touchez un morceau pour le rouvrir sans le séparer à nouveau.", 11, Ui.MUTED, false),
+        card.addView(Ui.text(this, "Morceaux déjà séparés · hors ligne", 16, Ui.INK, true));
+        card.addView(Ui.text(this, "Séparations et analyses sont enregistrées automatiquement. Touchez un morceau pour le rouvrir sans internet.", 11, Ui.MUTED, false),
                 Ui.lp(M, W, 0, 3, 0, 6));
         for (final StemStore.Song so : savedSongs) {
             LinearLayout row = new LinearLayout(this);
@@ -374,7 +382,7 @@ public class MainActivity extends Activity {
             LinearLayout t = vbox();
             t.addView(Ui.text(this, so.title, 14, Ui.INK, true));
             boolean current = !stems.isEmpty() && !stemsTitle.isEmpty() && so.title.equals(StemStore.safe(stemsTitle));
-            t.addView(Ui.text(this, so.count + " piste(s)" + (current ? " · affiché" : ""), 11, Ui.MUTED, false),
+            t.addView(Ui.text(this, so.count + " piste(s)" + (so.analyzed ? " · analysé ✓" : " · pas encore analysé") + (current ? " · affiché" : ""), 11, Ui.MUTED, false),
                     Ui.lp(W, W, 0, 2, 0, 0));
             row.addView(t, new LinearLayout.LayoutParams(0, W, 1f));
             row.addView(new IconView(this, IconView.ARROW, Ui.INK), new LinearLayout.LayoutParams(Ui.dp(18), Ui.dp(18)));
@@ -615,6 +623,8 @@ public class MainActivity extends Activity {
         for (View v : instViews) {
             if (v instanceof PianoView) ((PianoView) v).setTime(sec);
             else if (v instanceof BassView) ((BassView) v).setTime(sec);
+            else if (v instanceof DrumView) ((DrumView) v).setTime(sec);
+            else if (v instanceof ToubaView) ((ToubaView) v).setTime(sec);
         }
         if (force || tickCount % 15 == 0) {
             if (clockLabel != null) clockLabel.setText(fmtTime(pos) + " / " + fmtTime(durMs()));
@@ -638,6 +648,16 @@ public class MainActivity extends Activity {
     private static boolean isDrums(Stem x) {
         String n = x.name.toLowerCase(Locale.ROOT);
         return n.contains("batterie") || n.contains("drum");
+    }
+
+    private static boolean isBass(Stem x) {
+        String n = x.name.toLowerCase(Locale.ROOT);
+        return n.contains("basse") || n.contains("bass");
+    }
+
+    /** Pistes cochées par défaut : jamais la batterie (analysée à part) ni un « instrumental » (mélange de tout). */
+    private static boolean defaultSelected(String low) {
+        return !(low.contains("drum") || low.contains("batterie") || low.contains("instrum"));
     }
 
     /** Notes d'une piste, calées sur la tonalité du morceau si l'option est activée. */
@@ -680,28 +700,50 @@ public class MainActivity extends Activity {
         card.addView(Ui.text(this, "En lecture : " + names, 12, Ui.MUTED, false), Ui.lp(M, W, 0, 3, 0, 8));
 
         // défilé des notes
-        List<NoteRollView.Track> tracks = new ArrayList<>();
+        List<NoteRollView.Track> tracks = new ArrayList<>();     // défilé des notes (sans la batterie)
+        List<NoteRollView.Track> instTracks = new ArrayList<>(); // instruments animés (avec la batterie)
         for (Stem x : mix.keySet()) {
             List<PitchTranscriber.Note> n = notesOf(x);
-            if (n != null) tracks.add(new NoteRollView.Track(x.name, STEM_COLORS[stems.indexOf(x) % STEM_COLORS.length], n));
+            if (n != null) {
+                int colr = STEM_COLORS[stems.indexOf(x) % STEM_COLORS.length];
+                if (isDrums(x)) {
+                    // la batterie et le Touba sont deux instruments distincts
+                    instTracks.add(new NoteRollView.Track(x.name, colr, DrumTranscriber.kitOnly(n)));
+                    instTracks.add(new NoteRollView.Track("Touba", colr, DrumTranscriber.toubaOnly(n)));
+                } else {
+                    NoteRollView.Track t = new NoteRollView.Track(x.name, colr, n);
+                    instTracks.add(t);
+                    tracks.add(t);
+                }
+            }
         }
-        if (!tracks.isEmpty()) {
-            roll = new NoteRollView(this);
-            roll.setTracks(tracks, PitchTranscriber.keyScale(key));
-            card.addView(roll, new LinearLayout.LayoutParams(M, Ui.dp(180)));
-            rollNow = Ui.text(this, "…", 12, Ui.INK, true);
-            card.addView(rollNow, Ui.lp(M, W, 0, 6, 0, 0));
+        if (!instTracks.isEmpty()) {
+            if (!tracks.isEmpty()) {
+                roll = new NoteRollView(this);
+                roll.setTracks(tracks, PitchTranscriber.keyScale(key));
+                card.addView(roll, new LinearLayout.LayoutParams(M, Ui.dp(180)));
+                rollNow = Ui.text(this, "…", 12, Ui.INK, true);
+                card.addView(rollNow, Ui.lp(M, W, 0, 6, 0, 0));
+            }
 
-            // clavier de piano (avec un doigt) et guitare basse : notes jouées en temps réel
-            for (NoteRollView.Track tr : tracks) {
+            // piano (deux mains + accords), guitare basse et batterie : jeu en temps réel
+            for (NoteRollView.Track tr : instTracks) {
                 String ln = tr.name.toLowerCase(Locale.ROOT);
                 View inst = null;
                 int hDp = 0;
                 String title = "";
                 if (ln.contains("piano")) {
                     inst = new PianoView(this, tr);
-                    hDp = 150;
-                    title = "🎹 " + tr.name;
+                    hDp = 210;
+                    title = "🎹 " + tr.name + " : main gauche = accords, main droite = mélodie ou accompagnement";
+                } else if (ln.contains("touba")) {
+                    inst = new ToubaView(this, tr);
+                    hDp = 240;
+                    title = "🪘 " + tr.name + " : Touba grave (gauche) et Touba aigu (droite), joués à la main";
+                } else if (ln.contains("batterie") || ln.contains("drum")) {
+                    inst = new DrumView(this, tr);
+                    hDp = 240;
+                    title = "🥁 " + tr.name;
                 } else if (ln.contains("basse") || ln.contains("bass")) {
                     inst = new BassView(this, tr);
                     hDp = 130;
@@ -1394,6 +1436,9 @@ public class MainActivity extends Activity {
                 try {
                     String txt = GroqClient.transcribe(token, s.file, lang);
                     s.lyrics = txt.isEmpty() ? "Aucune parole détectée." : txt;
+                    if (!stemsTitle.isEmpty()) {
+                        try { NoteStore.saveLyrics(getApplicationContext(), stemsTitle, s.name, s.lyrics); } catch (Throwable ignored) { }
+                    }
                     toastLater("Paroles prêtes : voir en bas de l'onglet Pistes");
                 } catch (Exception e) {
                     toastLater("Erreur Groq : " + e.getMessage());
@@ -1512,8 +1557,24 @@ public class MainActivity extends Activity {
 
         for (final Stem s : stems) {
             if (s.notes == null) continue;
-            names.add(s.name);
-            final List<PitchTranscriber.Note> shown = notesOf(s);
+            final boolean drum = drum;
+            List<PitchTranscriber.Note> base = notesOf(s);
+            List<String> labels = new ArrayList<>();
+            List<List<PitchTranscriber.Note>> lists = new ArrayList<>();
+            labels.add(s.name);
+            if (drum) {
+                // batterie et Touba : deux cartes et deux pistes .mid séparées
+                lists.add(DrumTranscriber.kitOnly(base));
+                labels.add("Touba");
+                lists.add(DrumTranscriber.toubaOnly(base));
+            } else {
+                lists.add(base);
+            }
+            for (int e = 0; e < labels.size(); e++) {
+            final String label = labels.get(e);
+            final List<PitchTranscriber.Note> shown = lists.get(e);
+            if (e == 1 && shown.isEmpty()) continue;
+            names.add(label);
             tracks.add(shown);
 
             LinearLayout card = vbox();
@@ -1522,28 +1583,29 @@ public class MainActivity extends Activity {
             LinearLayout top = new LinearLayout(this);
             top.setOrientation(LinearLayout.HORIZONTAL);
             top.setGravity(Gravity.CENTER_VERTICAL);
-            top.addView(Ui.text(this, s.name, 17, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
-            top.addView(pill(shown.size() + " notes", Ui.YELLOW_SOFT, Ui.INK));
+            top.addView(Ui.text(this, label, 17, Ui.INK, true), new LinearLayout.LayoutParams(0, W, 1f));
+            top.addView(pill(shown.size() + (drum ? " coups" : " notes"), Ui.YELLOW_SOFT, Ui.INK));
             card.addView(top);
-            if (!isDrums(s)) {
+            if (!drum) {
                 card.addView(Ui.text(this, "Tonalité du morceau : " + songKey, 15, Ui.INK, true),
                         Ui.lp(M, W, 0, 6, 0, 0));
             }
             if (!s.engine.isEmpty()) {
                 card.addView(Ui.text(this, "Moteur : " + s.engine, 11, Ui.MUTED, false), Ui.lp(M, W, 0, 2, 0, 0));
             }
-            TextView list = Ui.text(this, describe(shown), 12, Ui.INK, false);
+            TextView list = Ui.text(this, drum ? describeDrums(shown) : describe(shown), 12, Ui.INK, false);
             list.setTypeface(Typeface.MONOSPACE);
             list.setTextIsSelectable(true);
             card.addView(list, Ui.lp(M, W, 0, 10, 0, 10));
-            card.addView(pillButtonYellow("Enregistrer " + s.name + " en .mid", new View.OnClickListener() {
+            card.addView(pillButtonYellow("Enregistrer " + label + " en .mid", new View.OnClickListener() {
                 @Override public void onClick(View v) {
                     List<List<PitchTranscriber.Note>> t1 = new ArrayList<>();
                     t1.add(shown);
-                    saveMidi(MidiWriter.write(Collections.singletonList(s.name), t1), s.name);
+                    saveMidi(MidiWriter.write(Collections.singletonList(label), t1), label);
                 }
             }));
             col.addView(card, Ui.lp(M, W, 0, 0, 0, 12));
+            }
         }
         if (tracks.isEmpty()) {
             LinearLayout empty = vbox();
@@ -1583,6 +1645,20 @@ public class MainActivity extends Activity {
         t.setBackground(Ui.box(bg, 10, 0, 0));
         t.setPadding(Ui.dp(9), Ui.dp(3), Ui.dp(9), Ui.dp(3));
         return t;
+    }
+
+    private String describeDrums(List<PitchTranscriber.Note> notes) {
+        if (notes.isEmpty()) return "Aucun coup détecté.";
+        StringBuilder sb = new StringBuilder();
+        int max = Math.min(notes.size(), 40);
+        for (int i = 0; i < max; i++) {
+            PitchTranscriber.Note n = notes.get(i);
+            int min = (int) (n.start / 60);
+            double sec = n.start - min * 60;
+            sb.append(String.format(Locale.US, "%d:%05.2f  %s\n", min, sec, DrumTranscriber.nameOf(n.pitch)));
+        }
+        if (notes.size() > max) sb.append("… +").append(notes.size() - max).append(" dans le .mid");
+        return sb.toString().trim();
     }
 
     private String describe(List<PitchTranscriber.Note> notes) {
@@ -1682,8 +1758,9 @@ public class MainActivity extends Activity {
         card.setPadding(Ui.dp(14), Ui.dp(14), Ui.dp(14), Ui.dp(14));
         card.addView(Ui.text(this, "Réglages MVSEP", 16, Ui.INK, true));
         card.addView(field("Clé API (mvsep.com/user-api)", "token", "", false));
-        card.addView(field("Type de séparation (sep_type, 63 = chant/basse/batterie/guitare/piano)", "sep_type", "63", true));
+        card.addView(field("Type de séparation (sep_type) : 63 = chant/basse/batterie/guitare/piano · 30 = Ensemble All-In, plus lent mais sépare mieux le piano des autres instruments", "sep_type", "63", true));
         card.addView(field("Option du modèle (add_opt1, facultatif)", "opt1", "", false));
+        card.addView(field("Affinage par modèles dédiés (2 = basse, batterie, piano, guitare · 1 = basse seulement · 0 = aucun). Séparation plus propre, mais plus longue", "refine", "2", true));
         col.addView(card);
 
         LinearLayout g = vbox();
@@ -1912,8 +1989,50 @@ public class MainActivity extends Activity {
         return "input." + ext;
     }
 
+    // Modèles MVSEP dédiés à un seul instrument : {nom de la piste, sep_type, add_opt1}
+    private static final String[][] REFINE = {
+            {"Basse", "41", "5"},      // MVSep Bass (BS Roformer SW + SCNet XL)
+            {"Batterie", "44", "6"},   // MVSep Drums (Mel + SCNet XL + BS Roformer SW)
+            {"Piano", "29", "5"},      // MVSep Piano (BS Roformer SW)
+            {"Guitare", "31", "7"}};   // MVSep Guitar (BS Roformer SW)
+
+    /**
+     * Remplace chaque piste du modèle multi-pistes par celle d'un modèle dédié à cet instrument (bien moins de
+     * mélange entre instruments). Si un modèle dédié échoue, on garde la piste d'origine.
+     * Réglage « refine » : 0 = aucun, 1 = basse seulement, 2 = basse + batterie + piano + guitare.
+     */
+    private List<Stem> refineStems(String token, File upload, String upName, List<Stem> base) {
+        String mode = prefs.getString("refine", "2").trim();
+        if (mode.equals("0")) return base;
+        int max = mode.equals("1") ? 1 : REFINE.length;
+        List<Stem> out = new ArrayList<>(base);
+        for (int r = 0; r < max; r++) {
+            String[] m = REFINE[r];
+            int at = -1;
+            for (int i = 0; i < out.size(); i++) if (out.get(i).name.equals(m[0])) at = i;
+            if (at < 0) continue;
+            try {
+                sepPct = 8f;
+                sepStatus = "Affinage : " + m[0] + " (modèle dédié)";
+                postLive();
+                List<Stem> ded = mvsepOnce(token, upload, upName, m[1], m[2], "ref" + r + "_");
+                for (Stem d : ded) {
+                    if (d.name.equals(m[0])) {
+                        d.poly = out.get(at).poly;
+                        d.selected = out.get(at).selected;
+                        out.set(at, d);
+                        break;
+                    }
+                }
+            } catch (Throwable ignore) {
+                // on garde la piste du modèle multi-pistes
+            }
+        }
+        return out;
+    }
+
     /** Une séparation MVSEP complète avec un modèle donné : envoi, attente, téléchargement des pistes. */
-    private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1)
+    private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1, String prefix)
             throws Exception {
         String hash;
         try {
@@ -1942,12 +2061,12 @@ public class MainActivity extends Activity {
             sepPct = 85f + 15f * i / files.size();
             sepStatus = "Téléchargement : " + frName(r.name);
             postLive();
-            File f = new File(getCacheDir(), "stem_" + i);
+            File f = new File(getCacheDir(), prefix + i);
             MvsepClient.download(r.url, f);
             Stem s = new Stem(frName(r.name), f);
             s.poly = guessPoly(r.name);
             String low = r.name.toLowerCase(Locale.ROOT);
-            s.selected = !(low.contains("drum") || low.contains("batterie"));
+            s.selected = defaultSelected(low);
             out.add(s);
         }
         return out;
@@ -2049,25 +2168,20 @@ public class MainActivity extends Activity {
                             sepPct = 8f;
                             sepStatus = a == 0 ? "Envoi à MVSEP" : "Autre modèle MVSEP (" + a + "/" + (uniq.size() - 1) + ")";
                             postLive();
-                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1]);
+                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1], "stem_");
                         } catch (Throwable mvsepFail) {
                             lastErr = String.valueOf(mvsepFail.getMessage());
                             if (lastErr.contains("not an Audio")) break; // un autre modèle n'y changera rien
                         }
                     }
                     if (fresh == null) {
-                        // Plan B : MVSEP indisponible -> on analyse le morceau complet sur le téléphone
-                        sepStatus = "Plan B : analyse du morceau complet"; postLive();
-                        File full = new File(getCacheDir(), "stem_full");
-                        copyFile(in, full);
-                        fresh = new ArrayList<>();
-                        Stem whole = new Stem("Morceau complet", full);
-                        whole.poly = true;
-                        fresh.add(whole);
+                        // Plus de « plan B » : analyser le morceau complet mélangerait tous les instruments.
                         String why = lastErr;
-                        if (why.length() > 110) why = why.substring(0, 110) + "…";
-                        planB[0] = "MVSEP indisponible (" + why + ") : le morceau complet est analysé à la place";
+                        if (why.length() > 160) why = why.substring(0, 160) + "…";
+                        throw new Exception("Séparation impossible (" + why + "). Vérifiez la clé API et la connexion, puis réessayez.");
                     }
+                    // Modèles dédiés (basse, batterie, piano, guitare) : pistes plus propres, sans mélange
+                    fresh = refineStems(token, upload, upName, fresh);
                     sepPct = 100f;
                     sepStatus = "Terminé";
                     sepRunning = false;
@@ -2101,19 +2215,23 @@ public class MainActivity extends Activity {
                 prefs.edit().putInt("sep_count", prefs.getInt("sep_count", 0) + 1).apply();
                 render(false);
                 toast(message);
+                // enregistrement automatique dans Musique/Separonsta : le morceau reste utilisable hors ligne
+                if (!alreadySaved && !title.isEmpty()) downloadStems(true);
             }
         });
     }
 
     // ============================================================ téléchargement dans Separonsta
     /** Enregistre chaque piste en MP3 : Musique/Separonsta/<titre>/<instrument>/<instrument>.mp3 */
-    private void downloadStems() {
+    private void downloadStems() { downloadStems(false); }
+
+    private void downloadStems(final boolean auto) {
         if (stems.isEmpty() || saving) return;
         if (Build.VERSION.SDK_INT < 29
                 && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             pendingAfterPerm = new Runnable() {
-                @Override public void run() { downloadStems(); }
+                @Override public void run() { downloadStems(auto); }
             };
             requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_PERM);
             return;
@@ -2124,10 +2242,10 @@ public class MainActivity extends Activity {
         for (Stem x : stems) {
             if (x.file != null && x.file.exists() && !x.name.equals("Morceau complet")) todo.add(x);
         }
-        if (todo.isEmpty()) { toast("Aucune piste à enregistrer"); return; }
+        if (todo.isEmpty()) { if (!auto) toast("Aucune piste à enregistrer"); return; }
         saving = true;
         render(false);
-        toast("Enregistrement de " + todo.size() + " piste(s)…");
+        toast((auto ? "Enregistrement automatique de " : "Enregistrement de ") + todo.size() + " piste(s)…");
         new Thread(new Runnable() {
             @Override public void run() {
                 int ok = 0;
@@ -2148,7 +2266,7 @@ public class MainActivity extends Activity {
                 saving = false;
                 if (ok == todo.size()) stemsSaved = true;
                 toastLater(ok == todo.size()
-                        ? ok + " piste(s) enregistrée(s) dans Musique/" + StemStore.ROOT + "/" + title
+                        ? ok + " piste(s) enregistrée(s) dans Musique/" + StemStore.ROOT + "/" + title + " · utilisable hors ligne"
                         : ok + "/" + todo.size() + " enregistrée(s). Erreur : " + err);
                 ui.post(new Runnable() {
                     @Override public void run() { render(false); }
@@ -2209,11 +2327,21 @@ public class MainActivity extends Activity {
                             }
                         };
                         List<PitchTranscriber.Note> res = null;
-                        try {
-                            res = BasicPitchTranscriber.transcribe(getApplicationContext(), pcm, s.poly, p);
-                            s.engine = "Basic Pitch (IA)";
-                        } catch (Throwable bpFail) {
-                            res = null; // la détection intégrée prend le relais
+                        if (isDrums(s)) {
+                            // batterie : on détecte les coups (grosse caisse, caisse claire, charleston…), pas des hauteurs
+                            res = DrumTranscriber.transcribe(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                            s.engine = "détection des coups (batterie + Touba)";
+                        } else if (isBass(s)) {
+                            // basse : détection dédiée (graves seulement, filtrée) pour ne plus faire d'erreurs
+                            res = PitchTranscriber.transcribeBass(pcm, PitchTranscriber.SAMPLE_RATE, p);
+                            s.engine = "détection de basse (graves filtrés)";
+                        } else {
+                            try {
+                                res = BasicPitchTranscriber.transcribe(getApplicationContext(), pcm, s.poly, p);
+                                s.engine = "Basic Pitch (IA)";
+                            } catch (Throwable bpFail) {
+                                res = null; // la détection intégrée prend le relais
+                            }
                         }
                         if (res == null) {
                             s.pct = 0f;
@@ -2238,6 +2366,7 @@ public class MainActivity extends Activity {
                     anaPct = 1f;
                     anaStatus = "Terminé";
                     anaRunning = false;
+                    autoSaveAnalysis();
                     final int added = total;
                     ui.post(new Runnable() {
                         @Override public void run() {
@@ -2260,6 +2389,25 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    /** Enregistre automatiquement les notes de chaque piste analysée : le morceau se rouvre ensuite hors ligne. */
+    private void autoSaveAnalysis() {
+        final String title = stemsTitle;
+        if (title.isEmpty()) return;
+        boolean any = false;
+        for (Stem x : new ArrayList<>(stems)) {
+            if (x.notes == null) continue;
+            try {
+                NoteStore.saveNotes(getApplicationContext(), title, x.name, x.notes, x.engine);
+                any = true;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (any) {
+            toastLater("Analyse enregistrée : « " + title + " » reste utilisable hors ligne");
+            refreshSavedSongs();
+        }
     }
 
     // ============================================================ aides

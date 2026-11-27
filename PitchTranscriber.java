@@ -89,6 +89,40 @@ final class PitchTranscriber {
 
     // ------------------------------------------------------------ Monophonique
     static List<Note> transcribeMono(float[] x, int sr, Progress progress) {
+        return mono(x, sr, progress, 28, 100, 0.03, 5, 1200, 0.15);
+    }
+
+    /**
+     * Basse : on ne garde que les graves (filtre passe-bas 450 Hz : plus de charleston, de voix ni de souffle),
+     * on limite la plage à Mi1–Sol4 (aucune note aiguë parasite), et on exige une note plus longue, plus forte
+     * et plus nettement périodique pour écarter les fuites de grosse caisse.
+     */
+    static List<Note> transcribeBass(float[] x, int sr, Progress progress) {
+        float[] y = lowPass(lowPass(x, sr, 450f), sr, 450f);
+        return mono(y, sr, progress, 28, 67, 0.07, 6, 450, 0.10);
+    }
+
+    /** Filtre passe-bas du 2e ordre (Butterworth). */
+    private static float[] lowPass(float[] x, int sr, float fc) {
+        double w0 = 2 * Math.PI * fc / sr;
+        double alpha = Math.sin(w0) / (2 * 0.70710678);
+        double cs = Math.cos(w0);
+        double a0 = 1 + alpha;
+        double b0 = (1 - cs) / 2 / a0, b1 = (1 - cs) / a0, b2 = b0;
+        double a1 = -2 * cs / a0, a2 = (1 - alpha) / a0;
+        float[] y = new float[x.length];
+        double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        for (int i = 0; i < x.length; i++) {
+            double v = b0 * x[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1; x1 = x[i];
+            y2 = y1; y1 = v;
+            y[i] = (float) v;
+        }
+        return y;
+    }
+
+    private static List<Note> mono(float[] x, int sr, Progress progress, int minMidi, int maxMidi,
+                                   double gateFrac, int minFrames, int maxHz, double yinThr) {
         final int W = 1024;
         final int TAU_MAX = 600;
         final int N = 2048;
@@ -109,7 +143,7 @@ final class PitchTranscriber {
             if (rms[f] > maxRms) maxRms = rms[f];
         }
         if (maxRms < 1e-4) return notes;
-        double gate = Math.max(0.03 * maxRms, 1e-4);
+        double gate = Math.max(gateFrac * maxRms, 1e-4);
 
         Fft fft = new Fft(N);
         double[] ar = new double[N];
@@ -120,7 +154,7 @@ final class PitchTranscriber {
         double[] cm = new double[TAU_MAX + 1];
         int[] midi = new int[frames];
         Arrays.fill(midi, -1);
-        int tauMin = Math.max(2, sr / 1200);
+        int tauMin = Math.max(2, sr / maxHz);
 
         for (int f = 0; f < frames; f++) {
             if (progress != null && f % 200 == 0) progress.onProgress(f * 100 / frames);
@@ -165,7 +199,7 @@ final class PitchTranscriber {
 
             int found = -1;
             for (int tau = tauMin; tau < TAU_MAX; tau++) {
-                if (cm[tau] < 0.15) {
+                if (cm[tau] < yinThr) {
                     while (tau + 1 < TAU_MAX && cm[tau + 1] < cm[tau]) tau++;
                     found = tau;
                     break;
@@ -181,7 +215,7 @@ final class PitchTranscriber {
             }
             double freq = sr / better;
             int m = (int) Math.round(69 + 12 * Math.log(freq / 440.0) / Math.log(2));
-            if (m >= 28 && m <= 100) midi[f] = m;
+            if (m >= minMidi && m <= maxMidi) midi[f] = m;
         }
 
         // Lissage médian sur 5 trames
@@ -214,7 +248,7 @@ final class PitchTranscriber {
             if (sm[f] < 0) { f++; continue; }
             int g = f;
             while (g < frames && sm[g] == sm[f]) g++;
-            if (g - f >= 5) {
+            if (g - f >= minFrames) {
                 double mean = 0;
                 for (int k = f; k < g; k++) mean += rms[k];
                 mean /= (g - f);
