@@ -1557,7 +1557,7 @@ public class MainActivity extends Activity {
 
         for (final Stem s : stems) {
             if (s.notes == null) continue;
-            final boolean drum = drum;
+            final boolean drum = isDrums(s);
             List<PitchTranscriber.Note> base = notesOf(s);
             List<String> labels = new ArrayList<>();
             List<List<PitchTranscriber.Note>> lists = new ArrayList<>();
