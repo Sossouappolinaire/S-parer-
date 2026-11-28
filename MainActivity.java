@@ -1760,7 +1760,6 @@ public class MainActivity extends Activity {
         card.addView(field("Clé API (mvsep.com/user-api)", "token", "", false));
         card.addView(field("Type de séparation (sep_type) : 63 = chant/basse/batterie/guitare/piano · 30 = Ensemble All-In, plus lent mais sépare mieux le piano des autres instruments", "sep_type", "63", true));
         card.addView(field("Option du modèle (add_opt1, facultatif)", "opt1", "", false));
-        card.addView(field("Affinage par modèles dédiés (2 = basse, batterie, piano, guitare · 1 = basse seulement · 0 = aucun). Séparation plus propre, mais plus longue", "refine", "2", true));
         col.addView(card);
 
         LinearLayout g = vbox();
@@ -1997,62 +1996,24 @@ public class MainActivity extends Activity {
         sepPct = pctBase + pctSpan * local / 100f;
     }
 
-    // Modèles MVSEP dédiés à un seul instrument : {nom de la piste, sep_type, add_opt1}
-    private static final String[][] REFINE = {
-            {"Basse", "41", "5"},      // MVSep Bass (BS Roformer SW + SCNet XL)
-            {"Batterie", "44", "6"},   // MVSep Drums (Mel + SCNet XL + BS Roformer SW)
-            {"Piano", "29", "5"},      // MVSep Piano (BS Roformer SW)
-            {"Guitare", "31", "7"}};   // MVSep Guitar (BS Roformer SW)
-
-    /**
-     * Remplace chaque piste du modèle multi-pistes par celle d'un modèle dédié à cet instrument (bien moins de
-     * mélange entre instruments). Si un modèle dédié échoue, on garde la piste d'origine.
-     * Réglage « refine » : 0 = aucun, 1 = basse seulement, 2 = basse + batterie + piano + guitare.
-     */
-    private List<Stem> refineStems(String token, File upload, String upName, List<Stem> base) {
-        String mode = prefs.getString("refine", "2").trim();
-        if (mode.equals("0")) return base;
-        int max = mode.equals("1") ? 1 : REFINE.length;
-        List<Stem> out = new ArrayList<>(base);
-        int total = 1 + max;
-        pctSpan = 100f / total;
-        for (int r = 0; r < max; r++) {
-            String[] m = REFINE[r];
-            int at = -1;
-            for (int i = 0; i < out.size(); i++) if (out.get(i).name.equals(m[0])) at = i;
-            if (at < 0) continue;
-            try {
-                pctBase = 100f * (r + 1) / total;
-                stepTag = "Étape " + (r + 2) + "/" + total + " · Affinage " + m[0] + " : ";
-                setPct(8f);
-                sepStatus = stepTag + "envoi au modèle dédié";
-                postLive();
-                List<Stem> ded = mvsepOnce(token, upload, upName, m[1], m[2], "ref" + r + "_");
-                for (Stem d : ded) {
-                    if (d.name.equals(m[0])) {
-                        d.poly = out.get(at).poly;
-                        d.selected = out.get(at).selected;
-                        out.set(at, d);
-                        break;
-                    }
-                }
-            } catch (Throwable ignore) {
-                // on garde la piste du modèle multi-pistes
-            }
-        }
-        return out;
-    }
-
     /** Une séparation MVSEP complète avec un modèle donné : envoi, attente, téléchargement des pistes. */
     private List<Stem> mvsepOnce(String token, File upload, String upName, String sepType, String opt1, String prefix)
             throws Exception {
-        String hash;
-        try {
-            hash = MvsepClient.create(token, upload, sepType, opt1, upName);
-        } catch (java.io.IOException first) {
-            sepStatus = stepTag + "Nouvel essai MVSEP"; postLive();
-            Thread.sleep(4000);
-            hash = MvsepClient.create(token, upload, sepType, opt1, upName);
+        String hash = null;
+        // MVSEP n'accepte qu'un seul fichier en attente par compte : si une tâche précédente n'est pas
+        // terminée, on patiente et on réessaie (jusqu'à ~10 min) au lieu d'échouer.
+        for (int attempt = 0; hash == null; attempt++) {
+            try {
+                hash = MvsepClient.create(token, upload, sepType, opt1, upName);
+            } catch (java.io.IOException e) {
+                String m = String.valueOf(e.getMessage());
+                if (m.contains("unprocessed file in queue") && attempt < 40) {
+                    sepStatus = stepTag + "Une tâche précédente est encore en cours chez MVSEP, attente…"; postLive();
+                    Thread.sleep(15000);
+                } else {
+                    throw e;
+                }
+            }
         }
         setPct(20f); sepStatus = stepTag + "En file d'attente chez MVSEP"; postLive();
 
@@ -2127,7 +2088,6 @@ public class MainActivity extends Activity {
         sepStatus = "Préparation du fichier";
         render(false);
 
-        final String[] planB = {null};
         exec.execute(new Runnable() {
             @Override public void run() {
                 try {
@@ -2160,50 +2120,25 @@ public class MainActivity extends Activity {
                         upName = "input." + ext;
                     }
 
-                    // Modèles essayés dans l'ordre : le suivant prend le relais si le précédent échoue
-                    List<String[]> attempts = new ArrayList<>();
-                    attempts.add(new String[]{sepType, opt1});
-                    attempts.add(new String[]{"63", ""});
-                    attempts.add(new String[]{"20", "2"});
-                    attempts.add(new String[]{"20", ""});
-                    List<String[]> uniq = new ArrayList<>();
-                    for (String[] a : attempts) {
-                        boolean dup = false;
-                        for (String[] u : uniq) if (u[0].equals(a[0]) && u[1].equals(a[1])) dup = true;
-                        if (!dup) uniq.add(a);
-                    }
-
-                    List<Stem> fresh = null;
-                    String lastErr = "";
-                    for (int a = 0; a < uniq.size() && fresh == null; a++) {
-                        try {
-                            String mode0 = prefs.getString("refine", "2").trim();
-                            int tot0 = 1 + (mode0.equals("0") ? 0 : (mode0.equals("1") ? 1 : REFINE.length));
-                            pctBase = 0f;
-                            pctSpan = 100f / tot0;
-                            stepTag = tot0 > 1 ? "Étape 1/" + tot0 + " · Séparation : " : "";
-                            setPct(8f);
-                            sepStatus = stepTag + (a == 0 ? "Envoi à MVSEP" : "Autre modèle MVSEP (" + a + "/" + (uniq.size() - 1) + ")");
-                            postLive();
-                            fresh = mvsepOnce(token, upload, upName, uniq.get(a)[0], uniq.get(a)[1], "stem_");
-                        } catch (Throwable mvsepFail) {
-                            lastErr = String.valueOf(mvsepFail.getMessage());
-                            if (lastErr.contains("not an Audio")) break; // un autre modèle n'y changera rien
-                        }
-                    }
-                    if (fresh == null) {
-                        // Plus de « plan B » : analyser le morceau complet mélangerait tous les instruments.
-                        String why = lastErr;
+                    // Un seul modèle MVSEP (celui des réglages) : une seule tâche envoyée, pas d'enchaînement
+                    pctBase = 0f;
+                    pctSpan = 100f;
+                    stepTag = "";
+                    setPct(8f);
+                    sepStatus = "Envoi à MVSEP";
+                    postLive();
+                    List<Stem> fresh;
+                    try {
+                        fresh = mvsepOnce(token, upload, upName, sepType, opt1, "stem_");
+                    } catch (Throwable mvsepFail) {
+                        String why = String.valueOf(mvsepFail.getMessage());
                         if (why.length() > 160) why = why.substring(0, 160) + "…";
                         throw new Exception("Séparation impossible (" + why + "). Vérifiez la clé API et la connexion, puis réessayez.");
                     }
-                    // Modèles dédiés (basse, batterie, piano, guitare) : pistes plus propres, sans mélange
-                    fresh = refineStems(token, upload, upName, fresh);
                     sepPct = 100f;
                     sepStatus = "Terminé";
                     sepRunning = false;
-                    finishSeparation(fresh, planB[0] != null ? "" : title,
-                            planB[0] != null ? planB[0] : "Séparation terminée", false);
+                    finishSeparation(fresh, title, "Séparation terminée", false);
                 } catch (Throwable e) {
                     sepRunning = false;
                     toastLater("Erreur : " + e.getMessage());

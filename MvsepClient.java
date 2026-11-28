@@ -92,12 +92,24 @@ final class MvsepClient {
     static List<Remote> waitForResult(String hash, Status cb) throws Exception {
         String url = BASE + "get?hash=" + URLEncoder.encode(hash, "UTF-8");
         final long t0 = System.currentTimeMillis();
+        int netFails = 0;
         for (int i = 0; i < 540; i++) { // ~90 minutes max (file d'attente MVSEP parfois longue)
-            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-            c.setConnectTimeout(30000);
-            c.setReadTimeout(60000);
-            String body = readBody(c);
-            JSONObject j = new JSONObject(body);
+            String body;
+            JSONObject j;
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(30000);
+                c.setReadTimeout(60000);
+                body = readBody(c);
+                j = new JSONObject(body);
+                netFails = 0;
+            } catch (IOException | org.json.JSONException e) {
+                // coupure réseau passagère : on ne perd pas la tâche déjà en file chez MVSEP, on réessaie
+                if (++netFails > 12) throw new IOException("Connexion perdue pendant l'attente : " + e.getMessage());
+                if (cb != null) cb.onStatus("connexion instable, nouvel essai");
+                Thread.sleep(10000);
+                continue;
+            }
             String st = j.optString("status", "");
             if (st.isEmpty() && j.optJSONObject("data") != null) {
                 st = j.getJSONObject("data").optString("status", "");
