@@ -140,6 +140,112 @@ final class StemStore {
         return null;
     }
 
+    // ------------------------------------------------------------ fichier d'analyse (.mid) à côté de l'audio
+    /** Enregistre l'analyse d'une piste : Separonsta/<titre>/<instrument>/<instrument>.mid */
+    static void saveAnalysisFile(Context ctx, String title, String instrument, byte[] data) throws Exception {
+        String inst = safe(instrument);
+        String fileName = inst + ".mid";
+        if (Build.VERSION.SDK_INT >= 29) {
+            String rel = Environment.DIRECTORY_MUSIC + "/" + ROOT + "/" + safe(title) + "/" + inst + "/";
+            ContentResolver cr = ctx.getContentResolver();
+            Uri target = findExisting(cr, rel, fileName);
+            boolean created = false;
+            if (target == null) {
+                ContentValues v = new ContentValues();
+                v.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                v.put(MediaStore.MediaColumns.MIME_TYPE, "audio/midi");
+                v.put(MediaStore.MediaColumns.RELATIVE_PATH, rel);
+                v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                target = cr.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, v);
+                created = true;
+            }
+            if (target == null) throw new java.io.IOException("création du fichier d'analyse impossible");
+            OutputStream os = cr.openOutputStream(target, "wt");
+            try {
+                os.write(data);
+                os.flush();
+            } finally {
+                os.close();
+            }
+            if (created) {
+                ContentValues done = new ContentValues();
+                done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                cr.update(target, done, null, null);
+            }
+        } else {
+            File dir = legacyDir(title, instrument);
+            if (!dir.exists() && !dir.mkdirs()) throw new java.io.IOException("dossier impossible à créer");
+            File out = new File(dir, fileName);
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(out);
+            try {
+                fo.write(data);
+            } finally {
+                fo.close();
+            }
+        }
+    }
+
+    /** Relit le fichier d'analyse d'une piste, ou null s'il n'existe pas. */
+    static byte[] readAnalysisFile(Context ctx, String title, String instrument) {
+        try {
+            String inst = safe(instrument);
+            String fileName = inst + ".mid";
+            InputStream in = null;
+            if (Build.VERSION.SDK_INT >= 29) {
+                String rel = Environment.DIRECTORY_MUSIC + "/" + ROOT + "/" + safe(title) + "/" + inst + "/";
+                Uri u = findExisting(ctx.getContentResolver(), rel, fileName);
+                if (u != null) in = ctx.getContentResolver().openInputStream(u);
+            } else {
+                File f = new File(legacyDir(title, instrument), fileName);
+                if (f.exists()) in = new FileInputStream(f);
+            }
+            if (in == null) return null;
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            try {
+                byte[] b = new byte[16384];
+                int r;
+                while ((r = in.read(b)) > 0) bo.write(b, 0, r);
+            } finally {
+                in.close();
+            }
+            return bo.toByteArray();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Vrai si au moins un fichier d'analyse existe pour ce morceau. */
+    static boolean hasAnalysisFile(Context ctx, String title) {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                String rel = Environment.DIRECTORY_MUSIC + "/" + ROOT + "/" + safe(title) + "/";
+                Cursor c = ctx.getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        new String[]{MediaStore.MediaColumns._ID},
+                        MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? AND " + MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?",
+                        new String[]{rel + "%", "%.mid"}, null);
+                if (c != null) {
+                    try {
+                        return c.moveToFirst();
+                    } finally {
+                        c.close();
+                    }
+                }
+            } else {
+                File[] dirs = new File(new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_MUSIC), ROOT), safe(title)).listFiles();
+                if (dirs != null) {
+                    for (File d : dirs) {
+                        File[] fs = d.isDirectory() ? d.listFiles() : null;
+                        if (fs == null) continue;
+                        for (File f : fs) if (f.getName().toLowerCase(Locale.ROOT).endsWith(".mid")) return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     /** Pistes déjà enregistrées pour ce morceau (liste vide s'il n'y en a pas). */
     static List<Entry> list(Context ctx, String title) {
         List<Entry> out = new ArrayList<>();
@@ -147,7 +253,8 @@ final class StemStore {
             if (Build.VERSION.SDK_INT >= 29) {
                 String rel = Environment.DIRECTORY_MUSIC + "/" + ROOT + "/" + safe(title) + "/";
                 Cursor c = ctx.getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                        new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH},
+                        new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH,
+                                MediaStore.MediaColumns.DISPLAY_NAME},
                         MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?",
                         new String[]{rel + "%"}, MediaStore.MediaColumns.RELATIVE_PATH + " ASC");
                 if (c != null) {
@@ -155,6 +262,8 @@ final class StemStore {
                         while (c.moveToNext()) {
                             String p = c.getString(1);
                             if (p == null || !p.startsWith(rel)) continue;
+                            String dn = c.getString(2);
+                            if (dn != null && dn.toLowerCase(Locale.ROOT).endsWith(".mid")) continue; // fichier d'analyse, pas de l'audio
                             String[] seg = p.substring(rel.length()).split("/");
                             if (seg.length == 0 || seg[0].isEmpty()) continue;
                             Uri u = android.content.ContentUris.withAppendedId(

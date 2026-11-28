@@ -51,7 +51,27 @@ final class NoteStore {
             }
         } catch (Exception ignored) {
         }
-        return false;
+        // pas d'analyse dans la mémoire de l'appli (réinstallation…) : on regarde les fichiers à côté de l'audio
+        return StemStore.hasAnalysisFile(ctx, title);
+    }
+
+    /** Copie l'analyse dans Musique/Separonsta (fichier .mid) pour qu'elle survive à une réinstallation. */
+    private static void mirror(Context ctx, String title, String instrument, JSONObject o) {
+        try {
+            List<PitchTranscriber.Note> notes = new ArrayList<>();
+            JSONArray arr = o.optJSONArray("notes");
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONArray a = arr.getJSONArray(i);
+                    notes.add(new PitchTranscriber.Note(a.getInt(0), a.getDouble(1), a.getDouble(2), a.getInt(3)));
+                }
+            }
+            String lyrics = o.has("lyrics") ? o.optString("lyrics", null) : null;
+            StemStore.saveAnalysisFile(ctx, title, instrument,
+                    NoteMidi.encode(instrument, notes, o.optString("engine", ""), lyrics));
+        } catch (Throwable ignored) {
+            // dossier inaccessible (permission refusée…) : l'analyse reste enregistrée dans l'appli
+        }
     }
 
     /** Enregistre les notes d'une piste (et ses paroles si elle en a). */
@@ -72,6 +92,7 @@ final class NoteStore {
         o.put("notes", arr);
         o.put("engine", engine == null ? "" : engine);
         write(f, o);
+        mirror(ctx, title, instrument, o);
     }
 
     /** Enregistre les paroles d'une piste. */
@@ -81,13 +102,23 @@ final class NoteStore {
         if (o == null) o = new JSONObject();
         o.put("lyrics", lyrics);
         write(f, o);
+        if (o.has("notes")) mirror(ctx, title, instrument, o);
     }
 
     /** Relit l'analyse d'une piste, ou null s'il n'y en a pas. */
     static synchronized Loaded load(Context ctx, String title, String instrument) {
         try {
             File f = file(ctx, title, instrument);
-            if (!f.exists()) return null;
+            if (!f.exists()) {
+                // analyse absente de l'appli (réinstallation) : on la relit depuis le fichier .mid du dossier Separonsta
+                NoteMidi.Data d = NoteMidi.decode(StemStore.readAnalysisFile(ctx, title, instrument));
+                if (d == null) return null;
+                Loaded r = new Loaded();
+                r.notes = d.notes;
+                r.engine = d.engine;
+                r.lyrics = d.lyrics;
+                return r;
+            }
             JSONObject o = read(f);
             if (o == null) return null;
             Loaded l = new Loaded();

@@ -45,3 +45,9 @@ Les fichiers `ic_launcher*.png/.xml` à la racine sont copiés dans `res/` au mo
 - Après la séparation, les pistes sont **enregistrées automatiquement** dans `Musique/Separonsta/<titre>/<instrument>/`.
 - Après l'analyse, les notes (et les paroles si générées) sont enregistrées automatiquement dans la mémoire de l'app.
 - La carte « Morceaux déjà séparés · hors ligne » (accueil et onglet Pistes) liste les morceaux ; un appui rouvre pistes, notes et paroles **sans internet**. « analysé ✓ » indique que les notes sont aussi disponibles.
+
+## Hors ligne et arrière-plan (v1.6)
+- **Analyse automatique** : après une séparation, ou à l'ouverture d'un morceau déjà séparé, les pistes cochées sans notes sont analysées toutes seules (sur le téléphone, sans internet), puis enregistrées. Le morceau est ensuite prêt à lire et à jouer hors ligne.
+- **L'analyse est rangée à côté de l'audio** : `Musique/Separonsta/<titre>/<instrument>/<instrument>.mid` (vrai fichier MIDI, avec le moteur et les paroles). Après une réinstallation, l'application la relit au lieu de refaire l'analyse.
+- **Accès à la musique** demandé au démarrage pour retrouver les morceaux du dossier Separonsta après une réinstallation.
+- **Arrière-plan** : pendant une séparation ou une analyse, une notification « en cours » s'affiche et Android n'arrête plus l'application quand on la quitte. Sur certains téléphones (Tecno, Infinix, Xiaomi…), désactivez aussi l'économie de batterie pour l'application.

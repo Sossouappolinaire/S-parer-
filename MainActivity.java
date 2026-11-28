@@ -52,6 +52,7 @@ public class MainActivity extends Activity {
     private static final int REQ_STEM = 2;
     private static final int REQ_SAVE = 3;
     private static final int REQ_PERM = 4;
+    private static final int REQ_MEDIA = 5;
 
     private static final int M = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int W = ViewGroup.LayoutParams.WRAP_CONTENT;
@@ -179,6 +180,52 @@ public class MainActivity extends Activity {
 
         render(false);
         loadTokenFromSupabase();
+        requestMediaAccess();
+    }
+
+    /** Accès à la musique (retrouver les morceaux de Separonsta) et aux notifications (suivi en arrière-plan). */
+    private void requestMediaAccess() {
+        if (Build.VERSION.SDK_INT < 23) return;
+        int asked = prefs.getInt("media_asked", 0);
+        if (asked >= 3) return; // refusé plusieurs fois : on n'insiste plus
+        List<String> need = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (checkSelfPermission("android.permission.READ_MEDIA_AUDIO") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                need.add("android.permission.READ_MEDIA_AUDIO");
+            if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                need.add("android.permission.POST_NOTIFICATIONS");
+        } else {
+            if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                need.add(android.Manifest.permission.READ_EXTERNAL_STORAGE);
+            if (Build.VERSION.SDK_INT < 29
+                    && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                need.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        }
+        if (need.isEmpty()) return;
+        prefs.edit().putInt("media_asked", asked + 1).apply();
+        requestPermissions(need.toArray(new String[0]), REQ_MEDIA);
+    }
+
+    // ------------------------------------------------------------ travail en arrière-plan
+    /** Démarre la notification « en cours » : Android n'arrête plus l'appli quand on la quitte. */
+    private void keepAlive(String text) {
+        try {
+            Intent i = new Intent(this, WorkService.class);
+            i.putExtra("text", text);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Arrête la notification quand plus aucune tâche ne tourne. */
+    private void releaseKeepAlive() {
+        // léger délai : l'analyse automatique qui suit une séparation démarre avant, et garde alors la notification
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (busy) return; // une autre tâche vient de démarrer (analyse après séparation)
+                try { stopService(new Intent(MainActivity.this, WorkService.class)); } catch (Throwable ignored) { }
+            }
+        }, 3000);
     }
 
     /** Récupère la clé MVSEP dans Supabase au lancement et l'enregistre. */
@@ -215,7 +262,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         stopPlayback();
-        exec.shutdownNow();
+        if (busy) exec.shutdown(); else exec.shutdownNow(); // une tâche en cours va jusqu'au bout
     }
 
     @Override
@@ -319,6 +366,7 @@ public class MainActivity extends Activity {
         sepPct = 5f;
         sepStatus = "Chargement de " + title;
         render(false);
+        keepAlive("Chargement de " + title);
         exec.execute(new Runnable() {
             @Override public void run() {
                 try {
@@ -335,6 +383,7 @@ public class MainActivity extends Activity {
                 } finally {
                     sepRunning = false;
                     busy = false;
+                    releaseKeepAlive();
                 }
             }
         });
@@ -655,9 +704,9 @@ public class MainActivity extends Activity {
         return n.contains("basse") || n.contains("bass");
     }
 
-    /** Pistes cochées par défaut : jamais la batterie (analysée à part) ni un « instrumental » (mélange de tout). */
+    /** Pistes cochées par défaut : toutes, sauf « Instrumental » (mélange de tout, il ferait doublon avec les autres pistes). */
     private static boolean defaultSelected(String low) {
-        return !(low.contains("drum") || low.contains("batterie") || low.contains("instrum"));
+        return !low.trim().startsWith("instrum");
     }
 
     /** Notes d'une piste, calées sur la tonalité du morceau si l'option est activée. */
@@ -927,6 +976,8 @@ public class MainActivity extends Activity {
     }
 
     private void postLive() {
+        if (sepRunning) WorkService.update(getApplicationContext(), "Séparation · " + (int) sepPct + " % · " + sepStatus);
+        else if (anaRunning) WorkService.update(getApplicationContext(), "Analyse · " + (int) (anaPct * 100) + " % · " + anaStatus);
         ui.post(new Runnable() {
             @Override public void run() { refreshLive(); }
         });
@@ -2087,6 +2138,7 @@ public class MainActivity extends Activity {
         sepPct = 2f;
         sepStatus = "Préparation du fichier";
         render(false);
+        keepAlive("Séparation en cours chez MVSEP");
 
         exec.execute(new Runnable() {
             @Override public void run() {
@@ -2148,6 +2200,7 @@ public class MainActivity extends Activity {
                 } finally {
                     sepRunning = false;
                     busy = false;
+                    releaseKeepAlive();
                 }
             }
         });
@@ -2169,8 +2222,28 @@ public class MainActivity extends Activity {
                 toast(message);
                 // enregistrement automatique dans Musique/Separonsta : le morceau reste utilisable hors ligne
                 if (!alreadySaved && !title.isEmpty()) downloadStems(true);
+                autoAnalyzeMissing(0);
             }
         });
+    }
+
+    /**
+     * Analyse automatique des pistes sans notes (la détection se fait sur le téléphone : aucune connexion
+     * nécessaire). Une fois fait, tout est enregistré : le morceau est prêt à lire et jouer hors ligne.
+     */
+    private void autoAnalyzeMissing(final int tries) {
+        boolean need = false;
+        for (Stem x : stems) if (x.selected && x.notes == null && x.file != null && x.file.exists()) need = true;
+        if (!need) return;
+        if (busy) { // la séparation termine tout juste : on réessaie dans un instant
+            if (tries < 20) {
+                ui.postDelayed(new Runnable() {
+                    @Override public void run() { autoAnalyzeMissing(tries + 1); }
+                }, 500);
+            }
+            return;
+        }
+        startTranscription(true);
     }
 
     // ============================================================ téléchargement dans Separonsta
@@ -2231,6 +2304,10 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
         super.onRequestPermissionsResult(code, perms, res);
+        if (code == REQ_MEDIA) {
+            refreshSavedSongs(); // l'accès à la musique vient peut-être d'être accordé
+            return;
+        }
         if (code != REQ_PERM) return;
         Runnable r = pendingAfterPerm;
         pendingAfterPerm = null;
@@ -2242,23 +2319,30 @@ public class MainActivity extends Activity {
     }
 
     // ============================================================ transcription
-    private void startTranscription() {
-        if (busy) { toast("Une tâche est en cours"); return; }
+    private void startTranscription() { startTranscription(false); }
+
+    /**
+     * onlyMissing = true : analyse automatique, seulement les pistes cochées qui n'ont pas encore de notes
+     * (celles déjà analysées et enregistrées sont gardées telles quelles).
+     */
+    private void startTranscription(boolean onlyMissing) {
+        if (busy) { if (!onlyMissing) toast("Une tâche est en cours"); return; }
         final List<Stem> chosen = new ArrayList<>();
         for (Stem s : stems) {
-            if (s.selected) {
-                s.notes = null;
-                s.pct = 0f;
-                chosen.add(s);
-            }
+            if (!s.selected) continue;
+            if (onlyMissing && s.notes != null) continue;
+            s.notes = null;
+            s.pct = 0f;
+            chosen.add(s);
         }
-        if (chosen.isEmpty()) { toast("Cochez au moins une piste"); return; }
+        if (chosen.isEmpty()) { if (!onlyMissing) toast("Cochez au moins une piste"); return; }
 
         busy = true;
         anaRunning = true;
         anaPct = 0f;
         anaStatus = "Décodage";
         render(false);
+        keepAlive("Analyse des pistes en cours");
 
         exec.execute(new Runnable() {
             @Override public void run() {
@@ -2314,6 +2398,7 @@ public class MainActivity extends Activity {
                         s.notes = res;
                         s.pct = 1f;
                         total += res.size();
+                        saveOneAnalysis(s); // enregistrée tout de suite : une piste qui plante plus loin ne fait rien perdre
                     }
                     anaPct = 1f;
                     anaStatus = "Terminé";
@@ -2338,28 +2423,47 @@ public class MainActivity extends Activity {
                 } finally {
                     anaRunning = false;
                     busy = false;
+                    releaseKeepAlive();
                 }
             }
         });
     }
 
     /** Enregistre automatiquement les notes de chaque piste analysée : le morceau se rouvre ensuite hors ligne. */
+    /** Titre sous lequel l'analyse est rangée (même règle que l'enregistrement des pistes audio). */
+    private String analysisTitle() {
+        if (!stemsTitle.isEmpty()) return stemsTitle;
+        return songName == null || songName.isEmpty() ? "Morceau importé" : StemStore.titleOf(songName);
+    }
+
+    /** Enregistre l'analyse d'une piste ; renvoie null si tout va bien, sinon le message d'erreur. */
+    private String saveOneAnalysis(Stem x) {
+        if (x == null || x.notes == null) return null;
+        try {
+            NoteStore.saveNotes(getApplicationContext(), analysisTitle(), x.name, x.notes, x.engine);
+            return null;
+        } catch (Throwable t) {
+            return String.valueOf(t.getMessage());
+        }
+    }
+
     private void autoSaveAnalysis() {
-        final String title = stemsTitle;
-        if (title.isEmpty()) return;
-        boolean any = false;
+        final String title = analysisTitle();
+        int ok = 0, total = 0;
+        String err = null;
         for (Stem x : new ArrayList<>(stems)) {
             if (x.notes == null) continue;
-            try {
-                NoteStore.saveNotes(getApplicationContext(), title, x.name, x.notes, x.engine);
-                any = true;
-            } catch (Throwable ignored) {
-            }
+            total++;
+            String e = saveOneAnalysis(x);
+            if (e == null) ok++; else err = e;
         }
-        if (any) {
-            toastLater("Analyse enregistrée : « " + title + " » reste utilisable hors ligne");
-            refreshSavedSongs();
+        if (total == 0) return;
+        if (ok == total) {
+            toastLater("Analyse enregistrée (" + ok + " piste(s)) : « " + title + " » reste utilisable hors ligne");
+        } else {
+            toastLater("Analyse enregistrée pour " + ok + "/" + total + " piste(s). Erreur : " + err);
         }
+        refreshSavedSongs();
     }
 
     // ============================================================ aides
